@@ -1,0 +1,6 @@
+{
+  "name": "RepoPilot AI — Autonomous Coding Agent",
+  "description": "Autonomous Python repository bug-fixing and feature engineering agent with ZIP security validation, multi-provider AI abstraction (Gemini, Nebius Token Factory, NVIDIA Nemotron), diff approval workflow, and isolated sandbox test repair loop.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

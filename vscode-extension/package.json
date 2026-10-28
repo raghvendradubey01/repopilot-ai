@@ -1,0 +1,142 @@
+{
+  "name": "repopilot-ai-vscode",
+  "displayName": "RepoPilot AI — Local Workspace Inspector & Coding Agent (Phase 1)",
+  "description": "Phase 1 VS Code extension for RepoPilot AI. Detects your open workspace via vscode.workspace.workspaceFolders, provides a nested file explorer, filename & text search, active-file analysis, and context-selective AI diagnosis.",
+  "version": "1.0.0",
+  "publisher": "repopilot-ai",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Linters"
+  ],
+  "activationEvents": [
+    "onView:repopilot.chatView",
+    "onView:repopilot.workspaceExplorerView",
+    "onCommand:repopilot.openSidebar",
+    "onCommand:repopilot.openChat",
+    "onCommand:repopilot.inspectWorkspace",
+    "onCommand:repopilot.analyzeActiveFile",
+    "onCommand:repopilot.configureApiKey"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc --noEmit",
+    "package": "vsce package"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "repopilot-sidebar",
+          "title": "RepoPilot AI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "repopilot-sidebar": [
+        {
+          "type": "tree",
+          "id": "repopilot.workspaceExplorerView",
+          "name": "Workspace Explorer (Filtered)"
+        },
+        {
+          "type": "webview",
+          "id": "repopilot.chatView",
+          "name": "RepoPilot AI Chat & Inspector"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "repopilot.openSidebar",
+        "title": "RepoPilot AI: Open Sidebar"
+      },
+      {
+        "command": "repopilot.openChat",
+        "title": "RepoPilot AI: Focus Chat Interface"
+      },
+      {
+        "command": "repopilot.inspectWorkspace",
+        "title": "RepoPilot AI: Inspect Current Workspace"
+      },
+      {
+        "command": "repopilot.analyzeActiveFile",
+        "title": "RepoPilot AI: Analyze Active File"
+      },
+      {
+        "command": "repopilot.openWorkspaceFile",
+        "title": "RepoPilot AI: Inspect File in Sidebar"
+      },
+      {
+        "command": "repopilot.configureApiKey",
+        "title": "RepoPilot AI: Configure Provider API Key (SecretStorage)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "repopilot.analyzeActiveFile",
+          "when": "editorTextFocus",
+          "group": "repopilot@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "RepoPilot AI",
+      "properties": {
+        "repopilot.connectionMode": {
+          "type": "string",
+          "enum": [
+            "repopilot-backend",
+            "direct-provider"
+          ],
+          "default": "repopilot-backend",
+          "description": "Reuse the existing RepoPilot AI server backend (http://localhost:3000) or query the configured AI provider directly using VS Code SecretStorage credentials."
+        },
+        "repopilot.backendUrl": {
+          "type": "string",
+          "default": "http://localhost:3000",
+          "description": "Base URL of the local RepoPilot AI server when connectionMode is 'repopilot-backend'."
+        },
+        "repopilot.provider": {
+          "type": "string",
+          "enum": [
+            "gemini",
+            "nebius",
+            "nvidia",
+            "custom"
+          ],
+          "default": "gemini",
+          "description": "AI provider used for workspace inspection and task analysis."
+        },
+        "repopilot.model": {
+          "type": "string",
+          "default": "gemini-3-flash-preview",
+          "description": "Model identifier (e.g., gemini-3-flash-preview, Qwen/Qwen2.5-Coder-32B-Instruct, nvidia/llama-3.1-nemotron-70b-instruct)."
+        },
+        "repopilot.openaiCompatibleBaseUrl": {
+          "type": "string",
+          "default": "https://api.studio.nebius.ai/v1",
+          "description": "Base URL for OpenAI-compatible providers (Nebius Token Factory, NVIDIA NIM, vLLM, Ollama)."
+        },
+        "repopilot.contextTokenBudget": {
+          "type": "number",
+          "default": 8000,
+          "description": "Maximum token budget for relevant workspace files sent per request. Entire repositories are never uploaded."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.7.2"
+  }
+}
