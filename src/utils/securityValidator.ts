@@ -19,6 +19,7 @@ export interface ValidatorOptions {
   maxArchiveBytes?: number;
   maxFileCount?: number;
   maxCompressionRatio?: number;
+  excludeSecretsAndBinariesByDefault?: boolean;
 }
 
 const DEFAULT_MAX_FILE_BYTES = 256 * 1024; // 256 KB per source file
@@ -49,6 +50,16 @@ const EXCLUDED_DIRECTORY_SEGMENTS = new Set([
   '.eggs',
   'htmlcov',
   'site-packages',
+  'dist-packages',
+  '__pypackages__',
+  'pypackages',
+  'wheels',
+  'pip-wheel-metadata',
+  'bower_components',
+  'jspm_packages',
+  'third_party',
+  '.poetry',
+  '.pdm-build',
   '__MACOSX',
   'vendor',
 ]);
@@ -226,11 +237,18 @@ export function isExcludedRepositoryDirectory(rawPath: string): {
     return { excluded: false };
   }
 
-  for (const seg of segments.slice(0, -1)) {
-    if (EXCLUDED_DIRECTORY_SEGMENTS.has(seg) || seg.endsWith('.egg-info')) {
+  for (let idx = 0; idx < segments.length - 1; idx++) {
+    const seg = segments[idx];
+    if (
+      EXCLUDED_DIRECTORY_SEGMENTS.has(seg) ||
+      seg.endsWith('.egg-info') ||
+      seg.endsWith('.dist-info') ||
+      (seg.toLowerCase() === 'lib' &&
+        /^python\d+(\.\d+)?$/i.test(segments[idx + 1] || ''))
+    ) {
       return {
         excluded: true,
-        reason: `Excluded directory "${seg}/" (filtered from repository index)`,
+        reason: `Excluded framework/environment directory "${seg}/" (filtered from repository index)`,
       };
     }
   }
@@ -550,6 +568,7 @@ export function validateRepositoryEntries(
   const maxFileCount = options.maxFileCount ?? DEFAULT_MAX_FILE_COUNT;
   const maxCompressionRatio =
     options.maxCompressionRatio ?? DEFAULT_MAX_COMPRESSION_RATIO;
+  const excludeByDefault = Boolean(options.excludeSecretsAndBinariesByDefault);
 
   const issues: ValidationIssue[] = [];
   const excludedFiles: ExcludedFileEntry[] = [];
@@ -598,10 +617,7 @@ export function validateRepositoryEntries(
       continue;
     }
 
-    activeInspectableCount++;
-    totalSizeBytes += entry.uncompressedBytes;
-
-    // Compression ratio check (zip bomb guard)
+    // Compression ratio check (zip bomb guard) — always fatal
     if (
       entry.compressedBytes &&
       entry.compressedBytes > 0 &&
@@ -629,7 +645,7 @@ export function validateRepositoryEntries(
         ).toFixed(0)} KB limit`,
       });
       issues.push({
-        severity: 'error',
+        severity: excludeByDefault ? 'warning' : 'error',
         code: 'OVERSIZED_FILE',
         filePath: normalizedPath,
         message: `File "${normalizedPath}" is ${(
@@ -657,7 +673,10 @@ export function validateRepositoryEntries(
           detail: typeIssue.message,
         });
       }
-      issues.push(typeIssue);
+      issues.push({
+        ...typeIssue,
+        severity: excludeByDefault ? 'warning' : typeIssue.severity,
+      });
     }
 
     const secretIssues = scanContentForSecrets(normalizedPath, entry.content);
@@ -668,7 +687,14 @@ export function validateRepositoryEntries(
         reason: 'secret_detected',
         detail: secretIssues[0].message,
       });
-      issues.push(...secretIssues);
+      issues.push(
+        ...secretIssues.map((si) => ({
+          ...si,
+          severity: (excludeByDefault ? 'warning' : si.severity) as
+            | 'error'
+            | 'warning',
+        }))
+      );
     }
 
     if (
@@ -676,6 +702,8 @@ export function validateRepositoryEntries(
       secretIssues.length === 0 &&
       entry.uncompressedBytes <= maxFileBytes
     ) {
+      activeInspectableCount++;
+      totalSizeBytes += entry.uncompressedBytes;
       acceptedFiles.push({
         path: normalizedPath,
         content: entry.content,
@@ -683,6 +711,9 @@ export function validateRepositoryEntries(
         language: inferLanguage(normalizedPath, entry.content),
         isTestFile: isSourceTestFile(normalizedPath),
       });
+    } else if (!excludeByDefault) {
+      activeInspectableCount++;
+      totalSizeBytes += entry.uncompressedBytes;
     }
   }
 
@@ -708,18 +739,44 @@ export function validateRepositoryEntries(
     });
   }
 
-  if (fileEntries.length > 0 && acceptedFiles.length === 0 && issues.length === 0) {
+  if (
+    fileEntries.length > 0 &&
+    acceptedFiles.length === 0 &&
+    issues.every((i) => i.severity !== 'error')
+  ) {
     fileTypesPassed = false;
     issues.push({
       severity: 'error',
       code: 'EMPTY_REPOSITORY',
       message:
-        'No valid source or configuration files were found in the uploaded repository.',
+        'No valid source or configuration files remained after excluding sensitive, binary, or oversized files.',
     });
   }
 
   const valid =
-    issues.every((i) => i.severity !== 'error') && acceptedFiles.length > 0;
+    pathTraversalPassed &&
+    issues.every((i) => i.severity !== 'error') &&
+    acceptedFiles.length > 0;
+
+  const sortedAccepted = valid
+    ? acceptedFiles.sort((a, b) => a.path.localeCompare(b.path))
+    : [];
+
+  const isSingleFileUpload = sortedAccepted.length === 1;
+  const hasUnresolvedRootRelative =
+    sortedAccepted.length > 0 &&
+    sortedAccepted.some(
+      (f) =>
+        f.language === 'python' &&
+        !f.path.includes('/') &&
+        /(?:^|\n)\s*from\s+\.[A-Za-z0-9_.]*\s+import\s+/m.test(f.content)
+    );
+  const isIncompleteContext = isSingleFileUpload || hasUnresolvedRootRelative;
+  const contextCompletenessNote = isSingleFileUpload
+    ? `Incomplete project context: Only a single file (${sortedAccepted[0].path}) was uploaded. Package-relative imports and external local module references cannot be verified without the surrounding repository files and will not be reported as definite bugs.`
+    : hasUnresolvedRootRelative
+    ? `Partial project context: Uploaded file(s) contain package-relative imports whose parent package or sibling modules were not uploaded. Unresolved relative imports are treated as context checks rather than bugs.`
+    : undefined;
 
   return {
     report: {
@@ -727,12 +784,14 @@ export function validateRepositoryEntries(
       archiveName,
       inspectedAt: new Date().toISOString(),
       totalFilesInspected: fileEntries.length,
-      acceptedFilesCount: valid ? acceptedFiles.length : 0,
+      acceptedFilesCount: valid ? sortedAccepted.length : 0,
       totalSizeBytes,
       maxAllowedFileBytes: maxFileBytes,
       maxAllowedArchiveBytes: maxArchiveBytes,
       issues,
       excludedFiles,
+      isIncompleteContext,
+      contextCompletenessNote,
       checksSummary: {
         pathTraversalPassed,
         sizeLimitsPassed,
@@ -740,9 +799,7 @@ export function validateRepositoryEntries(
         fileTypesPassed,
       },
     },
-    acceptedFiles: valid
-      ? acceptedFiles.sort((a, b) => a.path.localeCompare(b.path))
-      : [],
+    acceptedFiles: sortedAccepted,
   };
 }
 

@@ -1,9 +1,12 @@
 import React, { useRef, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
+  CheckCircle2,
   Cpu,
   Download,
   FolderGit2,
+  FolderUp,
   Github,
   Laptop,
   RefreshCw,
@@ -20,6 +23,7 @@ import type {
   SampleRepositoryPreset,
   SandboxExecutionMode,
   SandboxRunResponse,
+  UploadLimitsConfig,
   ValidationReport,
 } from '../types/repopilot';
 import { ArchitectureDocsView } from './ArchitectureDocsView';
@@ -40,6 +44,8 @@ interface SettingsAndAdvancedModalProps {
   onChangeCustomModel: (model: string) => void;
   contextTokenBudget: number;
   onChangeContextTokenBudget: (budget: number) => void;
+  uploadLimits: UploadLimitsConfig;
+  onChangeUploadLimits: (limits: UploadLimitsConfig) => void;
   isolatedSandboxAvailable: boolean;
   sandboxMode: SandboxExecutionMode;
   onChangeSandboxMode: (mode: SandboxExecutionMode) => void;
@@ -72,6 +78,8 @@ export const SettingsAndAdvancedModal: React.FC<
   onChangeCustomModel,
   contextTokenBudget,
   onChangeContextTokenBudget,
+  uploadLimits,
+  onChangeUploadLimits,
   isolatedSandboxAvailable,
   sandboxMode,
   onChangeSandboxMode,
@@ -132,7 +140,7 @@ export const SettingsAndAdvancedModal: React.FC<
             }`}
           >
             <Cpu className="w-3.5 h-3.5" />
-            <span>Models &amp; Providers</span>
+            <span>Models &amp; Upload Limits</span>
           </button>
 
           <button
@@ -179,14 +187,36 @@ export const SettingsAndAdvancedModal: React.FC<
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-5">
           {activeTab === 'general' && (
             <div className="flex flex-col gap-5">
+              {/* 1. AI Model & Provider Configuration */}
               <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-4 flex flex-col gap-4">
-                <div>
-                  <h3 className="text-sm font-semibold text-neutral-100">
-                    AI Model &amp; Provider Configuration
-                  </h3>
-                  <p className="text-xs text-neutral-400 mt-0.5">
-                    Select the reasoning provider used by RepoPilot AI. API keys are read securely from server environment variables or VS Code SecretStorage and are never exposed in the UI.
-                  </p>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-neutral-100">
+                      AI Model &amp; Provider Configuration
+                    </h3>
+                    <p className="text-xs text-neutral-400 mt-0.5">
+                      Select the server-side AI provider. API keys are read strictly from server environment variables and are never exposed in frontend code.
+                    </p>
+                  </div>
+                  <span
+                    className={`px-2.5 py-1 rounded-md text-[11px] font-medium flex items-center gap-1.5 shrink-0 ${
+                      selectedProvider.configuredOnServer
+                        ? 'bg-emerald-950/60 border border-emerald-500/30 text-emerald-300'
+                        : 'bg-amber-950/60 border border-amber-500/30 text-amber-300'
+                    }`}
+                  >
+                    {selectedProvider.configuredOnServer ? (
+                      <>
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Credentials Active</span>
+                      </>
+                    ) : (
+                      <>
+                        <AlertTriangle className="w-3.5 h-3.5" />
+                        <span>Missing {selectedProvider.envVarName}</span>
+                      </>
+                    )}
+                  </span>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -207,7 +237,11 @@ export const SettingsAndAdvancedModal: React.FC<
                     >
                       {providers.map((p) => (
                         <option key={p.id} value={p.id}>
-                          {p.name} ({p.configuredOnServer ? 'Configured' : p.envVarName})
+                          {p.name} (
+                          {p.configuredOnServer
+                            ? 'Configured'
+                            : `Requires ${p.envVarName}`}
+                          )
                         </option>
                       ))}
                     </select>
@@ -232,25 +266,126 @@ export const SettingsAndAdvancedModal: React.FC<
 
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-neutral-800 text-xs text-neutral-400">
                   <span>
-                    Endpoint: <code className="font-mono text-neutral-300">{selectedProvider.endpointUrl}</code>
+                    Endpoint:{' '}
+                    <code className="font-mono text-neutral-300">
+                      {selectedProvider.endpointUrl}
+                    </code>
                   </span>
                   <span>
-                    Server Env Var: <code className="font-mono text-neutral-300">{selectedProvider.envVarName}</code>
+                    Server Env Var:{' '}
+                    <code className="font-mono text-neutral-300">
+                      {selectedProvider.envVarName}
+                    </code>
                   </span>
                 </div>
               </div>
 
+              {/* 2. Configurable Upload Validation Limits */}
+              <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-4 flex flex-col gap-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-neutral-100">
+                    Configurable Upload Validation Limits
+                  </h3>
+                  <p className="text-xs text-neutral-400 mt-0.5">
+                    Enforced by the backend upload validator for both ZIP archives and multi-file uploads. Path traversal (`..`), `.env` files, private keys, and secrets are always blocked or excluded.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+                  <div className="flex flex-col gap-1.5">
+                    <label
+                      htmlFor="limit-file-count"
+                      className="font-medium text-neutral-300"
+                    >
+                      Max File Count
+                    </label>
+                    <input
+                      id="limit-file-count"
+                      type="number"
+                      min={5}
+                      max={500}
+                      value={uploadLimits.maxFileCount}
+                      onChange={(e) =>
+                        onChangeUploadLimits({
+                          ...uploadLimits,
+                          maxFileCount: Math.max(
+                            5,
+                            Math.min(500, Number(e.target.value) || 120)
+                          ),
+                        })
+                      }
+                      className="rounded-lg border border-neutral-700 bg-[#111113] px-3 py-2 font-mono text-xs text-neutral-100"
+                    />
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <label
+                      htmlFor="limit-file-kb"
+                      className="font-medium text-neutral-300"
+                    >
+                      Max Per-File Size (KB)
+                    </label>
+                    <input
+                      id="limit-file-kb"
+                      type="number"
+                      min={16}
+                      max={2048}
+                      value={Math.round(uploadLimits.maxFileBytes / 1024)}
+                      onChange={(e) =>
+                        onChangeUploadLimits({
+                          ...uploadLimits,
+                          maxFileBytes:
+                            Math.max(
+                              16,
+                              Math.min(2048, Number(e.target.value) || 256)
+                            ) * 1024,
+                        })
+                      }
+                      className="rounded-lg border border-neutral-700 bg-[#111113] px-3 py-2 font-mono text-xs text-neutral-100"
+                    />
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <label
+                      htmlFor="limit-archive-kb"
+                      className="font-medium text-neutral-300"
+                    >
+                      Max Total Project Size (KB)
+                    </label>
+                    <input
+                      id="limit-archive-kb"
+                      type="number"
+                      min={256}
+                      max={10240}
+                      value={Math.round(uploadLimits.maxArchiveBytes / 1024)}
+                      onChange={(e) =>
+                        onChangeUploadLimits({
+                          ...uploadLimits,
+                          maxArchiveBytes:
+                            Math.max(
+                              256,
+                              Math.min(10240, Number(e.target.value) || 4096)
+                            ) * 1024,
+                        })
+                      }
+                      className="rounded-lg border border-neutral-700 bg-[#111113] px-3 py-2 font-mono text-xs text-neutral-100"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* 3. Context Token Budget */}
               <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-4 flex flex-col gap-3">
                 <div className="flex items-center justify-between">
                   <div>
                     <h3 className="text-sm font-semibold text-neutral-100">
-                      Context Token Budget
+                      Context Token Budget (Chunking &amp; Retrieval)
                     </h3>
                     <p className="text-xs text-neutral-400">
-                      Maximum token budget for relevant workspace files sent per AI turn.
+                      For large uploaded projects, RepoPilot AI ranks and chunks relevant files within this token budget instead of sending every file in one request.
                     </p>
                   </div>
-                  <span className="font-mono text-xs text-neutral-200 tabular-nums">
+                  <span className="font-mono text-xs text-neutral-200 tabular-nums shrink-0">
                     {contextTokenBudget} tokens
                   </span>
                 </div>
@@ -268,11 +403,12 @@ export const SettingsAndAdvancedModal: React.FC<
                 />
               </div>
 
+              {/* 4. Validation Report Summary */}
               {validationReport && (
-                <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-4 flex flex-col gap-2 text-xs">
+                <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-4 flex flex-col gap-2.5 text-xs">
                   <div className="flex items-center justify-between">
                     <span className="font-semibold text-neutral-200">
-                      Workspace Security Validation ({validationReport.archiveName})
+                      Upload Security Report ({validationReport.archiveName})
                     </span>
                     <button
                       type="button"
@@ -283,8 +419,25 @@ export const SettingsAndAdvancedModal: React.FC<
                     </button>
                   </div>
                   <div className="text-neutral-400">
-                    {validationReport.acceptedFilesCount} safe files accepted · Path traversal, secret scan, and size limits enforced.
+                    {validationReport.acceptedFilesCount} safe files accepted ·{' '}
+                    {(validationReport.totalSizeBytes / 1024).toFixed(1)} KB total ·
+                    Path traversal, zip-bomb ratio, secret scan, and size limits enforced.
                   </div>
+                  {validationReport.excludedFiles &&
+                    validationReport.excludedFiles.length > 0 && (
+                      <div className="pt-2 border-t border-neutral-800 flex flex-col gap-1">
+                        <span className="font-medium text-amber-300">
+                          Excluded from AI Context ({validationReport.excludedFiles.length}):
+                        </span>
+                        <div className="max-h-28 overflow-y-auto space-y-1 font-mono text-[11px] text-neutral-400">
+                          {validationReport.excludedFiles.map((ex, i) => (
+                            <div key={i}>
+                              • {ex.path} — {ex.detail}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                 </div>
               )}
             </div>
@@ -346,6 +499,7 @@ interface WorkspacePickerModalProps {
   sampleRepos: SampleRepositoryPreset[];
   onSelectSampleRepo: (repoId: string) => void;
   onUploadZipFile: (file: File) => void;
+  onUploadFilesOrZip?: (files: FileList | File[]) => void;
   onImportGitHubRepo: (params: {
     repoUrl: string;
     branch?: string;
@@ -367,10 +521,10 @@ export const WorkspacePickerModal: React.FC<WorkspacePickerModalProps> = ({
   sampleRepos,
   onSelectSampleRepo,
   onUploadZipFile,
+  onUploadFilesOrZip,
   onImportGitHubRepo,
   isImportingGitHub,
 }) => {
-  const [showImportSection, setShowImportSection] = useState<boolean>(false);
   const [githubUrl, setGithubUrl] = useState<string>('');
   const [githubBranch, setGithubBranch] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -381,14 +535,16 @@ export const WorkspacePickerModal: React.FC<WorkspacePickerModalProps> = ({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Connect or Change Workspace"
+      aria-label="Upload or Switch Project"
       className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4"
     >
       <div className="w-full max-w-lg rounded-2xl border border-neutral-800 bg-[#141416] text-neutral-100 flex flex-col overflow-hidden shadow-2xl">
         <div className="px-5 py-4 border-b border-neutral-800 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Laptop className="w-4 h-4 text-neutral-300" />
-            <h2 className="text-base font-semibold">Workspace Connection</h2>
+            <FolderUp className="w-4 h-4 text-neutral-300" />
+            <h2 className="text-base font-semibold">
+              Upload or Switch Code Project
+            </h2>
           </div>
           <button
             type="button"
@@ -400,64 +556,55 @@ export const WorkspacePickerModal: React.FC<WorkspacePickerModalProps> = ({
           </button>
         </div>
 
-        <div className="p-5 flex flex-col gap-4 text-xs">
-          {/* Primary VS Code Workspace Section */}
-          <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-4 flex flex-col gap-3">
+        <div className="p-5 flex flex-col gap-4 text-xs max-h-[80vh] overflow-y-auto">
+          {/* 1. Primary Upload Project Section (ZIP or Multiple Individual Source Files) */}
+          <div className="rounded-xl border border-neutral-700 bg-[#18181B] p-4 flex flex-col gap-3">
             <div className="flex items-center justify-between">
               <span className="font-semibold text-neutral-100">
-                VS Code Workspace Bridge
+                Upload ZIP Archive or Individual Source Files
               </span>
               <span className="font-mono text-[11px] text-neutral-400">
-                {isWorkspaceConnected ? `Active: ${activeProjectName}` : 'Disconnected'}
+                Active: {activeProjectName}
               </span>
             </div>
             <p className="text-neutral-400 leading-relaxed">
-              Web browsers cannot directly read arbitrary folders on your computer. To work on a local project, open the folder in VS Code with the RepoPilot AI extension installed, or sync the active server workspace below.
+              Select a <code className="font-mono text-neutral-300">.zip</code> project archive or multiple individual source files (<code className="font-mono text-neutral-300">.py</code>, <code className="font-mono text-neutral-300">.ts</code>, <code className="font-mono text-neutral-300">.js</code>, <code className="font-mono text-neutral-300">.go</code>, <code className="font-mono text-neutral-300">.rs</code>, <code className="font-mono text-neutral-300">.java</code>, etc.). Secrets, <code className="font-mono text-neutral-300">.env</code> files, and build folders are excluded automatically.
             </p>
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                disabled={isSyncingLocalWorkspace}
-                onClick={async () => {
-                  onToggleWorkspaceConnected(true);
-                  await onSyncLocalWorkspace();
-                  onClose();
+                onClick={() => fileInputRef.current?.click()}
+                className="px-3.5 py-2 rounded-lg bg-neutral-100 text-neutral-900 hover:bg-white font-semibold flex items-center gap-1.5 cursor-pointer"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span>Choose ZIP or Source Files</span>
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept=".zip,.py,.pyi,.ts,.tsx,.js,.jsx,.mjs,.cjs,.java,.c,.h,.cpp,.cc,.hpp,.cs,.go,.rs,.php,.rb,.swift,.kt,.sql,.html,.css,.scss,.json,.yaml,.yml,.toml,.cfg,.ini,.xml,.md,.txt,.sh"
+                onChange={(e) => {
+                  const selected = e.target.files;
+                  if (selected && selected.length > 0) {
+                    onToggleWorkspaceConnected(true);
+                    if (onUploadFilesOrZip) {
+                      onUploadFilesOrZip(selected);
+                    } else {
+                      onUploadZipFile(selected[0]);
+                    }
+                    onClose();
+                  }
                 }}
-                className="px-3 py-1.5 rounded-lg bg-neutral-100 text-neutral-900 hover:bg-white font-semibold flex items-center gap-1.5 cursor-pointer"
-              >
-                <RefreshCw
-                  className={`w-3.5 h-3.5 ${
-                    isSyncingLocalWorkspace ? 'animate-spin' : ''
-                  }`}
-                />
-                <span>Connect Active Workspace</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={onDownloadVsCodeExtension}
-                className="px-3 py-1.5 rounded-lg border border-neutral-700 bg-neutral-800/80 hover:bg-neutral-800 text-neutral-200 flex items-center gap-1.5 cursor-pointer"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Download VS Code Extension</span>
-              </button>
-
-              {isWorkspaceConnected && (
-                <button
-                  type="button"
-                  onClick={() => onToggleWorkspaceConnected(false)}
-                  className="px-2.5 py-1.5 rounded-lg text-neutral-400 hover:text-neutral-200 cursor-pointer"
-                >
-                  Disconnect
-                </button>
-              )}
+                className="hidden"
+              />
             </div>
           </div>
 
-          {/* Switch Project Presets */}
+          {/* 2. Sample Code Projects */}
           <div className="flex flex-col gap-2">
             <span className="font-medium text-neutral-300">
-              Switch Project Workspace
+              Sample Projects for Quick Testing
             </span>
             <div className="grid grid-cols-1 gap-1.5">
               {sampleRepos.map((repo) => (
@@ -487,87 +634,80 @@ export const WorkspacePickerModal: React.FC<WorkspacePickerModalProps> = ({
             </div>
           </div>
 
-          {/* Optional Import Project (ZIP / GitHub) hidden under toggle */}
-          <div className="pt-2 border-t border-neutral-800 flex flex-col gap-3">
-            <button
-              type="button"
-              onClick={() => setShowImportSection((prev) => !prev)}
-              className="self-start text-neutral-400 hover:text-neutral-200 flex items-center gap-1.5 underline underline-offset-4 cursor-pointer"
-            >
-              <Upload className="w-3.5 h-3.5" />
-              <span>
-                {showImportSection
-                  ? 'Hide import options'
-                  : 'Import project (ZIP or GitHub)'}
+          {/* 3. GitHub Repository Import */}
+          <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-3.5 flex flex-col gap-2.5">
+            <span className="font-medium text-neutral-200 flex items-center gap-1.5">
+              <Github className="w-3.5 h-3.5" />
+              <span>Import Public GitHub Repository</span>
+            </span>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={githubUrl}
+                onChange={(e) => setGithubUrl(e.target.value)}
+                placeholder="https://github.com/owner/repo"
+                className="flex-1 rounded-lg border border-neutral-700 bg-[#111113] px-2.5 py-1.5 text-xs text-neutral-100"
+              />
+              <input
+                type="text"
+                value={githubBranch}
+                onChange={(e) => setGithubBranch(e.target.value)}
+                placeholder="Branch"
+                className="w-24 rounded-lg border border-neutral-700 bg-[#111113] px-2.5 py-1.5 text-xs text-neutral-100"
+              />
+              <button
+                type="button"
+                disabled={!githubUrl.trim() || isImportingGitHub}
+                onClick={async () => {
+                  onToggleWorkspaceConnected(true);
+                  await onImportGitHubRepo({
+                    repoUrl: githubUrl.trim(),
+                    branch: githubBranch.trim() || undefined,
+                  });
+                  onClose();
+                }}
+                className="px-3 py-1.5 rounded-lg bg-neutral-100 text-neutral-900 font-semibold cursor-pointer disabled:opacity-50"
+              >
+                Import
+              </button>
+            </div>
+          </div>
+
+          {/* 4. Local Workspace & VS Code Extension */}
+          <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-3.5 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Laptop className="w-4 h-4 text-neutral-400 shrink-0" />
+              <span className="text-neutral-300">
+                Local Workspace / VS Code Extension
               </span>
-            </button>
-
-            {showImportSection && (
-              <div className="rounded-xl border border-neutral-800 bg-[#18181B] p-3.5 flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-neutral-300">Upload ZIP Archive</span>
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="px-3 py-1.5 rounded-lg border border-neutral-700 bg-neutral-800 hover:bg-neutral-700 text-neutral-100 cursor-pointer"
-                  >
-                    Choose .zip file
-                  </button>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept=".zip"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) {
-                        onToggleWorkspaceConnected(true);
-                        onUploadZipFile(file);
-                        onClose();
-                      }
-                    }}
-                    className="hidden"
-                  />
-                </div>
-
-                <div className="pt-2 border-t border-neutral-800 flex flex-col gap-2">
-                  <span className="text-neutral-300 flex items-center gap-1.5">
-                    <Github className="w-3.5 h-3.5" />
-                    <span>Import Public GitHub Repository</span>
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      value={githubUrl}
-                      onChange={(e) => setGithubUrl(e.target.value)}
-                      placeholder="https://github.com/owner/repo"
-                      className="flex-1 rounded-lg border border-neutral-700 bg-[#111113] px-2.5 py-1.5 text-xs text-neutral-100"
-                    />
-                    <input
-                      type="text"
-                      value={githubBranch}
-                      onChange={(e) => setGithubBranch(e.target.value)}
-                      placeholder="Branch (optional)"
-                      className="w-28 rounded-lg border border-neutral-700 bg-[#111113] px-2.5 py-1.5 text-xs text-neutral-100"
-                    />
-                    <button
-                      type="button"
-                      disabled={!githubUrl.trim() || isImportingGitHub}
-                      onClick={async () => {
-                        onToggleWorkspaceConnected(true);
-                        await onImportGitHubRepo({
-                          repoUrl: githubUrl.trim(),
-                          branch: githubBranch.trim() || undefined,
-                        });
-                        onClose();
-                      }}
-                      className="px-3 py-1.5 rounded-lg bg-neutral-100 text-neutral-900 font-semibold cursor-pointer disabled:opacity-50"
-                    >
-                      Import
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={isSyncingLocalWorkspace}
+                onClick={async () => {
+                  onToggleWorkspaceConnected(true);
+                  await onSyncLocalWorkspace();
+                  onClose();
+                }}
+                className="px-2.5 py-1.5 rounded-lg border border-neutral-700 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 flex items-center gap-1 cursor-pointer"
+              >
+                <RefreshCw
+                  className={`w-3 h-3 ${
+                    isSyncingLocalWorkspace ? 'animate-spin' : ''
+                  }`}
+                />
+                <span>Sync Local</span>
+              </button>
+              <button
+                type="button"
+                onClick={onDownloadVsCodeExtension}
+                className="px-2.5 py-1.5 rounded-lg border border-neutral-700 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 flex items-center gap-1 cursor-pointer"
+              >
+                <Download className="w-3 h-3" />
+                <span>VS Code Ext</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>

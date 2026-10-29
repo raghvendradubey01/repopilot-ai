@@ -20,9 +20,14 @@ import type {
   RepoFile,
   SandboxExecutionMode,
   SandboxRunResponse,
+  UploadLimitsConfig,
   ValidationReport,
 } from './types/repopilot';
-import { applyApprovedPatchImmutably } from './utils/diffEngine';
+import {
+  applyApprovedPatchImmutably,
+  resolveFilesForExport,
+  resolveIndividualFileForDownload,
+} from './utils/diffEngine';
 import { SAMPLE_REPOSITORIES } from './utils/sampleRepos';
 import {
   redactSecrets,
@@ -73,6 +78,11 @@ export default function App() {
 
   const [viewingStagedCopy, setViewingStagedCopy] = useState<boolean>(false);
   const [contextTokenBudget, setContextTokenBudget] = useState<number>(8000);
+  const [uploadLimits, setUploadLimits] = useState<UploadLimitsConfig>({
+    maxFileBytes: 256 * 1024,
+    maxArchiveBytes: 4 * 1024 * 1024,
+    maxFileCount: 120,
+  });
 
   const [validationReport, setValidationReport] =
     useState<ValidationReport | null>(() => {
@@ -83,7 +93,10 @@ export default function App() {
       }));
       return validateRepositoryEntries('billing-engine-py.zip', entries).report;
     });
-  const [, setIsValidatingZip] = useState<boolean>(false);
+  const [isUploadingProject, setIsUploadingProject] = useState<boolean>(false);
+  const [uploadStatusMessage, setUploadStatusMessage] = useState<string | null>(
+    null
+  );
   const [isImportingGitHub, setIsImportingGitHub] = useState<boolean>(false);
 
   const [providers, setProviders] = useState<AIProviderInfo[]>([
@@ -104,16 +117,20 @@ export default function App() {
       name: 'Nebius Token Factory',
       vendor: 'Nebius AI Studio',
       protocol: 'openai-compatible',
-      defaultModel: 'Qwen/Qwen2.5-Coder-32B-Instruct',
+      defaultModel: 'nvidia/Llama-3_1-Nemotron-Ultra-253B-v1',
       supportedModels: [
+        'nvidia/Llama-3_1-Nemotron-Ultra-253B-v1',
+        'nvidia/Llama-3_3-Nemotron-Super-49B-v1',
+        'nvidia/llama-3.1-nemotron-70b-instruct',
         'Qwen/Qwen2.5-Coder-32B-Instruct',
-        'deepseek-ai/DeepSeek-R1',
+        'deepseek-ai/DeepSeek-V3',
         'meta-llama/Llama-3.3-70B-Instruct',
       ],
-      endpointUrl: 'https://api.studio.nebius.ai/v1',
+      endpointUrl: 'https://api.tokenfactory.nebius.com/v1',
       configuredOnServer: false,
       envVarName: 'NEBIUS_API_KEY',
-      description: 'OpenAI-compatible adapter for Nebius Token Factory.',
+      description:
+        'OpenAI-compatible adapter for Nebius Token Factory (https://api.tokenfactory.nebius.com/v1) running NVIDIA open-source Nemotron & coding models.',
     },
     {
       id: 'nvidia',
@@ -123,7 +140,9 @@ export default function App() {
       defaultModel: 'nvidia/llama-3.1-nemotron-70b-instruct',
       supportedModels: [
         'nvidia/llama-3.1-nemotron-70b-instruct',
-        'meta/llama-3.1-405b-instruct',
+        'nvidia/llama-3.3-nemotron-super-49b-v1',
+        'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+        'meta/llama-3.1-70b-instruct',
       ],
       endpointUrl: 'https://integrate.api.nvidia.com/v1',
       configuredOnServer: false,
@@ -195,6 +214,11 @@ export default function App() {
       });
   }, []);
 
+  const selectedProviderInfo = useMemo(
+    () => providers.find((p) => p.id === selectedProviderId) || providers[0],
+    [providers, selectedProviderId]
+  );
+
   const currentSamplePreset = useMemo(
     () => SAMPLE_REPOSITORIES.find((r) => r.id === activeRepoId),
     [activeRepoId]
@@ -222,7 +246,7 @@ export default function App() {
 
   const modifiedPaths = useMemo(() => {
     const set = new Set<string>();
-    if (patchBundle && patchBundle.approvalStatus !== 'rejected') {
+    if (patchBundle && patchBundle.approvalStatus === 'approved_staged') {
       for (const ch of patchBundle.changes) {
         set.add(ch.filePath);
       }
@@ -389,7 +413,8 @@ export default function App() {
         }));
         const { report } = validateRepositoryEntries(
           data.workspaceName || 'local-workspace',
-          entries
+          entries,
+          { excludeSecretsAndBinariesByDefault: true }
         );
         loadNewRepositoryIntoWorkspace(
           subdir === 'vscode-extension'
@@ -455,6 +480,7 @@ export default function App() {
       uncompressedBytes: f.sizeBytes,
     }));
     const { report } = validateRepositoryEntries(`${found.id}.zip`, entries);
+    setUploadStatusMessage(null);
     loadNewRepositoryIntoWorkspace(
       found.id,
       found.files,
@@ -463,48 +489,149 @@ export default function App() {
     );
   };
 
-  const handleUploadZipFile = async (file: File) => {
-    setIsValidatingZip(true);
-    setErrorBanner(null);
-    try {
-      const arrayBuf = await file.arrayBuffer();
-      const uint8 = new Uint8Array(arrayBuf);
-      let binary = '';
-      for (let i = 0; i < uint8.byteLength; i++) {
-        binary += String.fromCharCode(uint8[i]);
-      }
-      const base64Zip = btoa(binary);
+  const handleUploadFilesOrZip = async (fileListInput: FileList | File[]) => {
+    const fileArray = Array.from(fileListInput);
+    if (fileArray.length === 0) return;
 
-      const res = await fetch('/api/validate-zip', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          archiveName: file.name,
-          base64Zip,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setErrorBanner(data.error || 'ZIP validation failed.');
+    setIsUploadingProject(true);
+    setErrorBanner(null);
+    setUploadStatusMessage(null);
+
+    try {
+      // Case 1: Single .zip archive uploaded
+      if (
+        fileArray.length === 1 &&
+        fileArray[0].name.toLowerCase().endsWith('.zip')
+      ) {
+        const zipFile = fileArray[0];
+        const arrayBuf = await zipFile.arrayBuffer();
+        const uint8 = new Uint8Array(arrayBuf);
+        let binary = '';
+        for (let i = 0; i < uint8.byteLength; i++) {
+          binary += String.fromCharCode(uint8[i]);
+        }
+        const base64Zip = btoa(binary);
+
+        const res = await fetch('/api/upload-project', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            projectName: zipFile.name.replace(/\.zip$/i, ''),
+            base64Zip,
+            limits: uploadLimits,
+          }),
+        });
+        const data = await res.json();
+        if (data.report) {
+          setValidationReport(data.report);
+        }
+        if (!res.ok) {
+          setErrorBanner(data.error || 'ZIP archive validation failed.');
+          return;
+        }
+
+        if (data.acceptedFiles && data.acceptedFiles.length > 0) {
+          const cleanName =
+            data.projectName || zipFile.name.replace(/\.zip$/i, '');
+          loadNewRepositoryIntoWorkspace(
+            cleanName,
+            data.acceptedFiles,
+            `Analyze uploaded project "${cleanName}", identify any bugs with file and line references, explain the root cause, and propose minimal fixes.`,
+            data.report
+          );
+          const contextSuffix =
+            data.acceptedFiles.length === 1
+              ? ' Note: Single-file upload (incomplete project context — unresolved package-relative imports will not be flagged as bugs).'
+              : '';
+          setUploadStatusMessage(
+            `Uploaded "${cleanName}" (${data.acceptedFiles.length} source file${
+              data.acceptedFiles.length === 1 ? '' : 's'
+            } validated and indexed).${contextSuffix}`
+          );
+        }
         return;
       }
 
-      setValidationReport(data.report);
-      if (data.report.valid && data.acceptedFiles.length > 0) {
+      // Case 2: Multiple (or single) individual source files uploaded
+      const uploadedFilesPayload: Array<{
+        path: string;
+        content: string;
+        sizeBytes: number;
+      }> = [];
+
+      for (const f of fileArray) {
+        if (f.name.toLowerCase().endsWith('.zip')) {
+          continue;
+        }
+        const relPath =
+          (f as File & { webkitRelativePath?: string }).webkitRelativePath ||
+          f.name;
+        const textContent = await f.text();
+        uploadedFilesPayload.push({
+          path: relPath,
+          content: textContent,
+          sizeBytes: f.size,
+        });
+      }
+
+      const inferredProjectName =
+        fileArray.length === 1
+          ? fileArray[0].name.replace(/\.[^.]+$/, '') || 'uploaded-file'
+          : `uploaded-project (${fileArray.length} files)`;
+
+      const res = await fetch('/api/upload-project', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectName: inferredProjectName,
+          files: uploadedFilesPayload,
+          limits: uploadLimits,
+        }),
+      });
+
+      const data = await res.json();
+      if (data.report) {
+        setValidationReport(data.report);
+      }
+      if (!res.ok) {
+        setErrorBanner(data.error || 'Source file validation failed.');
+        return;
+      }
+
+      if (data.acceptedFiles && data.acceptedFiles.length > 0) {
+        const cleanName = data.projectName || inferredProjectName;
         loadNewRepositoryIntoWorkspace(
-          'custom-upload',
+          cleanName,
           data.acceptedFiles,
-          `Inspect and fix issues in uploaded repository ${file.name}.`,
+          `Analyze the uploaded source files (${data.acceptedFiles
+            .map((af: RepoFile) => af.path)
+            .slice(0, 4)
+            .join(', ')}), identify any bugs, explain the problems, and propose fixes.`,
           data.report
+        );
+        const singleFileNotice =
+          data.acceptedFiles.length === 1
+            ? ' Project context is incomplete (single-file upload): unresolved relative imports will be treated as context checks rather than bugs.'
+            : '';
+        setUploadStatusMessage(
+          `Uploaded ${data.acceptedFiles.length} source file${
+            data.acceptedFiles.length === 1 ? '' : 's'
+          } into "${cleanName}".${singleFileNotice}`
         );
       }
     } catch (err) {
       setErrorBanner(
-        err instanceof Error ? err.message : 'Failed to validate uploaded ZIP.'
+        err instanceof Error
+          ? err.message
+          : 'Failed to process uploaded project files.'
       );
     } finally {
-      setIsValidatingZip(false);
+      setIsUploadingProject(false);
     }
+  };
+
+  const handleUploadZipFile = async (file: File) => {
+    await handleUploadFilesOrZip([file]);
   };
 
   const handleImportGitHubRepo = async (params: {
@@ -531,9 +658,11 @@ export default function App() {
 
       if (data.acceptedFiles && data.acceptedFiles.length > 0) {
         loadNewRepositoryIntoWorkspace(
-          data.repoId || 'github-import',
+          data.repoName || 'github-import',
           data.acceptedFiles,
-          `Analyze imported GitHub repository (${data.repoName || params.repoUrl}) and fix any bugs or failing tests.`,
+          `Analyze imported GitHub repository (${
+            data.repoName || params.repoUrl
+          }) and fix any bugs or failing tests.`,
           data.report
         );
       }
@@ -549,7 +678,7 @@ export default function App() {
   };
 
   const handleTriggerMaliciousZipTest = async () => {
-    setIsValidatingZip(true);
+    setIsUploadingProject(true);
     setErrorBanner(null);
     try {
       const res = await fetch('/api/validate-zip', {
@@ -569,7 +698,7 @@ export default function App() {
         err instanceof Error ? err.message : 'Failed to run security fixture.'
       );
     } finally {
-      setIsValidatingZip(false);
+      setIsUploadingProject(false);
     }
   };
 
@@ -764,7 +893,9 @@ export default function App() {
           providerId: selectedProviderId,
         }),
       });
-      const data = (await res.json()) as SandboxRunResponse & { error?: string };
+      const data = (await res.json()) as SandboxRunResponse & {
+        error?: string;
+      };
       if (!res.ok) {
         setErrorBanner(data.error || 'Sandbox execution failed.');
         return;
@@ -782,10 +913,10 @@ export default function App() {
         data.attempts[data.attempts.length - 1]?.command || 'pytest -q';
       const honestSummary =
         !data.isSimulated && data.verificationStatus === 'VERIFIED'
-          ? `Verified: Real test suite (\`${lastCmd}\`) executed and passed (Retries: ${data.retryCount}/${data.maxRetries}).`
+          ? `Verified: Real test suite (\`${lastCmd}\`) executed in isolated sandbox and passed (Retries: ${data.retryCount}/${data.maxRetries}).`
           : data.verificationStatus === 'FAILED'
           ? `Failed: Test suite (\`${lastCmd}\`) failed after ${data.retryCount}/${data.maxRetries} repair attempt(s). Click "Inspect test output" to review logs.`
-          : `Not Verified: Static syntax and patch checks completed for \`${lastCmd}\` (Retries: ${data.retryCount}/${data.maxRetries}), but an isolated container runner was not active. Click "Inspect test output" to view details.`;
+          : `Not Verified: Static syntax and patch checks completed for \`${lastCmd}\`, but an isolated container runner is not configured on this host so tests were not executed in a live runtime.`;
 
       setChatMessages((prev) => [
         ...prev,
@@ -851,31 +982,57 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const handleDownloadPatchedZip = async () => {
-    const filesToExport =
-      patchBundle && patchBundle.approvalStatus !== 'rejected'
-        ? applyApprovedPatchImmutably(originalFiles, patchBundle.changes)
-        : originalFiles;
+  const handleDownloadIndividualFile = (
+    filePath: string,
+    preferCorrected = true
+  ) => {
+    const resolved = resolveIndividualFileForDownload(
+      filePath,
+      originalFiles,
+      patchBundle,
+      preferCorrected
+    );
+    if (!resolved) return;
 
+    const blob = new Blob([resolved.content], {
+      type: 'text/plain;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = resolved.fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadPatchedZip = async () => {
+    const {
+      files: filesToExport,
+      isApprovedExport,
+      unifiedPatchToInclude,
+    } = resolveFilesForExport(originalFiles, patchBundle);
+
+    const cleanSlug =
+      activeProjectName.replace(/[^A-Za-z0-9_.-]+/g, '-') || 'project';
     const zip = new JSZip();
+
+    // Preserve exact relative directory structure inside the ZIP archive
     for (const file of filesToExport) {
-      zip.file(
-        `${activeRepoId}-patched/${file.path}`,
-        redactSecrets(file.content)
-      );
+      zip.file(file.path, redactSecrets(file.content));
     }
-    if (patchBundle) {
-      zip.file(
-        `${activeRepoId}-patched/repopilot-changes.patch`,
-        redactSecrets(patchBundle.unifiedPatchFile)
-      );
+    if (unifiedPatchToInclude) {
+      zip.file('repopilot-changes.patch', unifiedPatchToInclude);
     }
 
     const blob = await zip.generateAsync({ type: 'blob' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `${activeRepoId}-patched.zip`;
+    link.download = isApprovedExport
+      ? `${cleanSlug}-corrected.zip`
+      : `${cleanSlug}.zip`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -908,6 +1065,10 @@ export default function App() {
         sampleRepos={SAMPLE_REPOSITORIES}
         onSelectSampleRepo={handleSelectSampleRepo}
         onUploadZipFile={handleUploadZipFile}
+        onUploadFilesOrZip={handleUploadFilesOrZip}
+        isUploadingProject={isUploadingProject}
+        validationReport={validationReport}
+        onDownloadCorrectedZip={handleDownloadPatchedZip}
       />
 
       {/* 2. MAIN CHAT AREA */}
@@ -916,6 +1077,8 @@ export default function App() {
         onOpenSidebar={() => setIsSidebarOpen(true)}
         activeProjectName={activeProjectName}
         activeModelName={customModel}
+        isProviderConfigured={selectedProviderInfo.configuredOnServer}
+        activeProviderEnvVar={selectedProviderInfo.envVarName}
         isWorkspaceConnected={isWorkspaceConnected}
         onOpenWorkspaceModal={() => setIsWorkspaceModalOpen(true)}
         onOpenSettings={(tab = 'general') => {
@@ -931,6 +1094,11 @@ export default function App() {
         onTriggerQuickAction={(action) => handleTriggerQuickAction(action)}
         isAnalyzing={isAnalyzing}
         isRunningSandbox={isRunningSandbox}
+        isUploadingProject={isUploadingProject}
+        uploadStatusMessage={uploadStatusMessage}
+        onDismissUploadStatus={() => setUploadStatusMessage(null)}
+        onUploadFilesOrZip={handleUploadFilesOrZip}
+        validationReport={validationReport}
         patchBundle={patchBundle}
         sandboxRunResult={sandboxRunResult}
         onApprovePatch={handleApprovePatch}
@@ -939,12 +1107,15 @@ export default function App() {
         onRunTests={handleRunSandboxTests}
         onApproveAndRunTests={handleApproveAndRun}
         onDownloadPatchFile={handleDownloadPatchFile}
+        onDownloadCorrectedZip={handleDownloadPatchedZip}
+        onDownloadIndividualFile={handleDownloadIndividualFile}
         onSubmitClarification={handleSubmitClarification}
         errorBanner={errorBanner}
         onDismissError={() => setErrorBanner(null)}
         isFileViewerOpen={isFileViewerOpen}
         onCloseFileViewer={() => setIsFileViewerOpen(false)}
         activeFile={activeFile}
+        filesCount={activeFileList.length}
         selectedFilePath={selectedFilePath}
         onSelectFile={handleSelectFile}
         selectionContext={selectionContext}
@@ -953,7 +1124,7 @@ export default function App() {
         onToggleViewingStagedCopy={setViewingStagedCopy}
       />
 
-      {/* 3. WORKSPACE CONNECTION & IMPORT MODAL */}
+      {/* 3. WORKSPACE CONNECTION & UPLOAD MODAL */}
       <WorkspacePickerModal
         isOpen={isWorkspaceModalOpen}
         onClose={() => setIsWorkspaceModalOpen(false)}
@@ -967,6 +1138,7 @@ export default function App() {
         sampleRepos={SAMPLE_REPOSITORIES}
         onSelectSampleRepo={handleSelectSampleRepo}
         onUploadZipFile={handleUploadZipFile}
+        onUploadFilesOrZip={handleUploadFilesOrZip}
         onImportGitHubRepo={handleImportGitHubRepo}
         isImportingGitHub={isImportingGitHub}
       />
@@ -990,6 +1162,8 @@ export default function App() {
         onChangeCustomModel={setCustomModel}
         contextTokenBudget={contextTokenBudget}
         onChangeContextTokenBudget={setContextTokenBudget}
+        uploadLimits={uploadLimits}
+        onChangeUploadLimits={setUploadLimits}
         isolatedSandboxAvailable={isolatedSandboxAvailable}
         sandboxMode={sandboxMode}
         onChangeSandboxMode={setSandboxMode}

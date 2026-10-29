@@ -396,14 +396,28 @@ export async function runSandboxAndRepairLoop(params: {
   mode: SandboxExecutionMode;
   providerId: AIProviderId;
   customModel?: string;
+  repairGeneratorFn?: typeof generateAnalysisAndPatch;
 }): Promise<SandboxRunResponse> {
+  if (params.patchBundle.approvalStatus !== 'approved_staged') {
+    throw new Error(
+      'Safety Gate: Proposed patch must be explicitly approved by the user before applying in the disposable workspace or running verification.'
+    );
+  }
+
   const maxRetries = 2;
+  const repairGenerator = params.repairGeneratorFn || generateAnalysisAndPatch;
   const capabilities = getSandboxCapabilities();
   const baseDiagnostics: AgentDiagnosticsReport | undefined =
     params.patchBundle.diagnostics;
   const toolchain = detectLanguageToolchain(
     params.originalFiles,
     capabilities.isolatedSandboxAvailable
+  );
+  const discoveredTestFilesCount = Math.max(
+    1,
+    params.originalFiles.filter((f) => f.isTestFile).length ||
+      params.patchBundle.structuredOutput?.tests_to_run.targeted_tests.length ||
+      1
   );
 
   // 1. If Strict Isolated Container Only mode is selected and no external isolated sandbox is attached:
@@ -430,6 +444,13 @@ export async function runSandboxAndRepairLoop(params: {
         'NOT VERIFIED — Isolated Execution Sandbox Unavailable: Arbitrary code is never executed on the host machine, and test results are never fabricated. Download the patch or switch to Labeled Demo Simulation Mode for sample repositories.',
       retryCount: 0,
       maxRetries,
+      testSummary: {
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        notRun: discoveredTestFilesCount,
+        executionAvailable: false,
+      },
       attempts: [
         {
           attempt: 1,
@@ -451,6 +472,8 @@ export async function runSandboxAndRepairLoop(params: {
           failedTests: [],
           passedCount: 0,
           failedCount: 0,
+          skippedCount: 0,
+          notRunCount: discoveredTestFilesCount,
           resourceLimits: DEFAULT_LIMITS,
         },
       ],
@@ -465,7 +488,7 @@ export async function runSandboxAndRepairLoop(params: {
     };
   }
 
-  // 2. Run targeted & full checks with up to 2 autonomous repair iterations
+  // 2. Run targeted & full checks in a separate disposable workspace copy with up to 2 autonomous repair iterations
   const attempts: SandboxAttemptLog[] = [];
   let currentBundle: ProposedPatchBundle = {
     ...params.patchBundle,
@@ -480,6 +503,7 @@ export async function runSandboxAndRepairLoop(params: {
 
   for (let attemptIndex = 0; attemptIndex <= maxRetries; attemptIndex++) {
     const attemptNumber = attemptIndex + 1;
+    // Apply the approved patch ONLY in a separate disposable workspace copy
     const stagedFiles = applyApprovedPatchImmutably(
       params.originalFiles,
       currentBundle.changes
@@ -507,6 +531,13 @@ export async function runSandboxAndRepairLoop(params: {
         bannerMessage: `PARTIALLY VERIFIED: Static syntax & import validation passed for ${toolchain.primaryLanguage}, but runtime execution of "${toolchain.recommendedTestCommand}" requires an isolated container sandbox (SANDBOX_RUNNER_URL).`,
         retryCount: 0,
         maxRetries,
+        testSummary: {
+          passed: 0,
+          failed: 0,
+          skipped: 0,
+          notRun: discoveredTestFilesCount,
+          executionAvailable: false,
+        },
         attempts: [
           {
             attempt: 1,
@@ -524,6 +555,8 @@ export async function runSandboxAndRepairLoop(params: {
             failedTests: [],
             passedCount: 0,
             failedCount: 0,
+            skippedCount: 0,
+            notRunCount: discoveredTestFilesCount,
             syntaxAndImportErrors: [],
             resourceLimits: DEFAULT_LIMITS,
           },
@@ -566,6 +599,8 @@ export async function runSandboxAndRepairLoop(params: {
         failedTests: [],
         passedCount: evalResult.passedCount,
         failedCount: 0,
+        skippedCount: 0,
+        notRunCount: 0,
         syntaxAndImportErrors: [],
         resourceLimits: DEFAULT_LIMITS,
       });
@@ -604,6 +639,13 @@ export async function runSandboxAndRepairLoop(params: {
             : `TESTS PASSED AFTER ${attemptIndex} REPAIR(S) — VERIFIED: Agent diagnosed test failure and repaired patch cleanly.`,
         retryCount: attemptIndex,
         maxRetries,
+        testSummary: {
+          passed: evalResult.passedCount,
+          failed: 0,
+          skipped: 0,
+          notRun: 0,
+          executionAvailable: capabilities.isolatedSandboxAvailable,
+        },
         attempts,
         finalPatchBundle: verifiedBundle,
         diagnostics: updatedDiagnostics,
@@ -619,7 +661,7 @@ export async function runSandboxAndRepairLoop(params: {
 
     let repairAnalysis: string | undefined;
     if (attemptIndex < maxRetries) {
-      const repairResult = await generateAnalysisAndPatch({
+      const repairResult = await repairGenerator({
         providerId: params.providerId,
         customModel: params.customModel,
         repoId: params.repoId,
@@ -673,6 +715,8 @@ export async function runSandboxAndRepairLoop(params: {
       failedTests: evalResult.failedTests,
       passedCount: evalResult.passedCount,
       failedCount: evalResult.failedCount,
+      skippedCount: 0,
+      notRunCount: 0,
       syntaxAndImportErrors: evalResult.syntaxAndImportErrors,
       repairAnalysis,
       repairedFiles:
@@ -681,6 +725,7 @@ export async function runSandboxAndRepairLoop(params: {
     });
   }
 
+  const lastAttempt = attempts[attempts.length - 1];
   const failedDiagnostics: AgentDiagnosticsReport | undefined =
     currentBundle.diagnostics
       ? {
@@ -705,6 +750,13 @@ export async function runSandboxAndRepairLoop(params: {
       'TESTS FAILED: Verification checks remained failing after reaching the maximum limit of 2 autonomous repair retries. Inspect the failure output or revert changes.',
     retryCount: maxRetries,
     maxRetries,
+    testSummary: {
+      passed: lastAttempt?.passedCount ?? 0,
+      failed: lastAttempt?.failedCount ?? 1,
+      skipped: lastAttempt?.skippedCount ?? 0,
+      notRun: lastAttempt?.notRunCount ?? 0,
+      executionAvailable: capabilities.isolatedSandboxAvailable,
+    },
     attempts,
     finalPatchBundle: {
       ...currentBundle,
@@ -716,3 +768,4 @@ export async function runSandboxAndRepairLoop(params: {
     diagnostics: failedDiagnostics,
   };
 }
+

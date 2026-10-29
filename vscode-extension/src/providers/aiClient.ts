@@ -431,7 +431,7 @@ export function resolveConfiguredAIProvider(
   const tokenBudget = config.get<number>('contextTokenBudget') || 8000;
   const openaiBaseUrl =
     config.get<string>('openaiCompatibleBaseUrl') ||
-    'https://api.studio.nebius.ai/v1';
+    'https://api.tokenfactory.nebius.com/v1';
 
   if (connectionMode === 'direct-provider') {
     return {

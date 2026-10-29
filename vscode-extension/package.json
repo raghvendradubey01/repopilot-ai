@@ -123,8 +123,8 @@
         },
         "repopilot.openaiCompatibleBaseUrl": {
           "type": "string",
-          "default": "https://api.studio.nebius.ai/v1",
-          "description": "Base URL for OpenAI-compatible providers (Nebius Token Factory, NVIDIA NIM, vLLM, Ollama)."
+          "default": "https://api.tokenfactory.nebius.com/v1",
+          "description": "Base URL for OpenAI-compatible providers (Nebius Token Factory: https://api.tokenfactory.nebius.com/v1, NVIDIA NIM, vLLM, Ollama)."
         },
         "repopilot.contextTokenBudget": {
           "type": "number",

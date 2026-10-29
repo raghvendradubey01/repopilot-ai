@@ -305,11 +305,40 @@ export const DiagnosticsPanelView: React.FC<DiagnosticsPanelViewProps> = ({
                           {d.importsValid ? 'PASS' : 'FAIL'}
                         </div>
                         {d.errors.length > 0 && (
-                          <ul className="mt-1 text-rose-300">
-                            {d.errors.map((err, i) => (
-                              <li key={i}>- {err}</li>
-                            ))}
-                          </ul>
+                          <div className="mt-1.5">
+                            <span className="text-rose-400 font-semibold">
+                              Confirmed Errors:
+                            </span>
+                            <ul className="mt-0.5 text-rose-300">
+                              {d.errors.map((err, i) => (
+                                <li key={i}>- {err}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {d.warnings && d.warnings.length > 0 && (
+                          <div className="mt-1.5">
+                            <span className="text-amber-400 font-semibold">
+                              Possible Issues:
+                            </span>
+                            <ul className="mt-0.5 text-amber-300">
+                              {d.warnings.map((warn, i) => (
+                                <li key={i}>- {warn}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {d.contextChecks && d.contextChecks.length > 0 && (
+                          <div className="mt-1.5">
+                            <span className="text-sky-400 font-semibold">
+                              Checks Requiring More Project Context:
+                            </span>
+                            <ul className="mt-0.5 text-sky-300/90">
+                              {d.contextChecks.map((chk, i) => (
+                                <li key={i}>- {chk}</li>
+                              ))}
+                            </ul>
+                          </div>
                         )}
                       </div>
                     ))}

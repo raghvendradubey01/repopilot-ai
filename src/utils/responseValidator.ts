@@ -3,6 +3,10 @@ import type {
   StructuredAgentOutput,
   VerificationStatus,
 } from '../types/repopilot';
+import {
+  checkPythonSyntaxAndImports,
+  deduplicateValidationMessages,
+} from './patchValidator';
 
 const VALID_VERIFICATION_STATUSES = new Set<VerificationStatus>([
   'VERIFIED',
@@ -130,13 +134,33 @@ export function validateStructuredAgentResponse(
   }
 
   // 5. Validate files_to_change against actual repository files
-  const validPathSet = new Set(repoFiles.map((f) => f.path));
+  const canonicalPathByNorm = new Map<string, string>();
+  for (const f of repoFiles) {
+    canonicalPathByNorm.set(f.path, f.path);
+    const norm = f.path
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '')
+      .replace(/^\/+/, '');
+    canonicalPathByNorm.set(norm, f.path);
+  }
+
+  const resolveRepoPath = (raw: unknown): string | null => {
+    if (typeof raw !== 'string' || !raw.trim()) return null;
+    const direct = canonicalPathByNorm.get(raw.trim());
+    if (direct) return direct;
+    const norm = raw
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '')
+      .replace(/^\/+/, '');
+    return canonicalPathByNorm.get(norm) || null;
+  };
 
   if (!Array.isArray(obj.files_to_change)) {
     errors.push('"files_to_change" must be an array of strings.');
   } else {
     for (const fp of obj.files_to_change) {
-      if (typeof fp !== 'string' || !validPathSet.has(fp)) {
+      if (!resolveRepoPath(fp)) {
         errors.push(
           `Invalid file in "files_to_change": "${String(
             fp
@@ -156,7 +180,7 @@ export function validateStructuredAgentResponse(
         errors.push(`"proposed_patch[${i}]" must be an object.`);
         continue;
       }
-      if (typeof p.file_path !== 'string' || !validPathSet.has(p.file_path)) {
+      if (!resolveRepoPath(p.file_path)) {
         errors.push(
           `"proposed_patch[${i}].file_path" ("${String(
             p.file_path
@@ -221,37 +245,123 @@ export function validateStructuredAgentResponse(
   }
 
   if (errors.length > 0) {
-    return { valid: false, errors };
+    return { valid: false, errors: deduplicateValidationMessages(errors) };
+  }
+
+  // Pre-compute static import checks per file so we can filter out any hallucinated
+  // false-positive relative-import / Path / json bugs on valid single-file uploads
+  const fileStaticImportValid = new Map<string, boolean>();
+  for (const rfItem of repoFiles) {
+    const check = checkPythonSyntaxAndImports(
+      rfItem.path,
+      rfItem.content,
+      repoFiles
+    );
+    fileStaticImportValid.set(rfItem.path, check.importsValid);
+  }
+
+  const rawRemainingRisks = (obj.remaining_risks as unknown[]).map(String);
+  let deduplicatedBugs: NonNullable<StructuredAgentOutput['identified_bugs']> | undefined;
+
+  if (Array.isArray(obj.identified_bugs)) {
+    const seenBugKeys = new Set<string>();
+    deduplicatedBugs = [];
+
+    for (const rawBug of obj.identified_bugs as Array<Record<string, unknown>>) {
+      if (!rawBug || typeof rawBug !== 'object') continue;
+      const canonicalFile =
+        resolveRepoPath(rawBug.file_path) || String(rawBug.file_path || '');
+      const lineRef = String(rawBug.line_reference || 'L1').trim();
+      const title = String(rawBug.title || 'Identified Code Issue').trim();
+      const explanation = String(rawBug.explanation || '').trim();
+      const recommendedFix = String(rawBug.recommended_fix || '').trim();
+      const sevRaw = String(rawBug.severity || '').toLowerCase();
+      const severity = (
+        ['critical', 'high', 'medium', 'low'].includes(sevRaw)
+          ? sevRaw
+          : 'medium'
+      ) as 'critical' | 'high' | 'medium' | 'low';
+
+      const bugKey = `${canonicalFile}::${lineRef.toLowerCase()}::${title.toLowerCase()}::${explanation.toLowerCase()}`;
+      if (seenBugKeys.has(bugKey)) {
+        continue;
+      }
+      seenBugKeys.add(bugKey);
+
+      const combinedText = `${title} ${explanation}`.toLowerCase();
+      const claimsFalseMissingImport =
+        fileStaticImportValid.get(canonicalFile) === true &&
+        repoFiles.length === 1 &&
+        (/missing.*relative\s+import/i.test(combinedText) ||
+          /unresolved.*relative\s+import/i.test(combinedText) ||
+          (combinedText.includes('missing import') &&
+            (/\bpath\b/i.test(combinedText) || /\bjson\b/i.test(combinedText))));
+
+      if (claimsFalseMissingImport) {
+        rawRemainingRisks.push(
+          `Context check (${canonicalFile}): ${title} — target module was not included in this single-file upload.`
+        );
+        continue;
+      }
+
+      deduplicatedBugs.push({
+        file_path: canonicalFile,
+        line_reference: lineRef,
+        severity,
+        title,
+        explanation,
+        recommended_fix: recommendedFix,
+      });
+    }
   }
 
   const parsedOutput: StructuredAgentOutput = {
     task_summary: String(obj.task_summary),
-    acceptance_criteria: (obj.acceptance_criteria as string[]).map(String),
+    acceptance_criteria: deduplicateValidationMessages(
+      (obj.acceptance_criteria as string[]).map(String)
+    ),
     repository_findings: {
       language: String(rf!.language),
-      dependencies: (rf!.dependencies as unknown[]).map(String),
-      entry_points: (rf!.entry_points as unknown[]).map(String),
-      relevant_files: (rf!.relevant_files as unknown[]).map(String),
-      existing_tests: (rf!.existing_tests as unknown[]).map(String),
+      dependencies: deduplicateValidationMessages(
+        (rf!.dependencies as unknown[]).map(String)
+      ),
+      entry_points: deduplicateValidationMessages(
+        (rf!.entry_points as unknown[]).map(String)
+      ),
+      relevant_files: deduplicateValidationMessages(
+        (rf!.relevant_files as unknown[]).map(String)
+      ),
+      existing_tests: deduplicateValidationMessages(
+        (rf!.existing_tests as unknown[]).map(String)
+      ),
       caller_relationships: Array.isArray(rf!.caller_relationships)
-        ? (rf!.caller_relationships as unknown[]).map(String)
+        ? deduplicateValidationMessages(
+            (rf!.caller_relationships as unknown[]).map(String)
+          )
         : [],
     },
     root_cause: {
       type: rc!.type as StructuredAgentOutput['root_cause']['type'],
       description: String(rc!.description),
-      evidence_files: (rc!.evidence_files as unknown[]).map(String),
+      evidence_files: deduplicateValidationMessages(
+        (rc!.evidence_files as unknown[]).map(String)
+      ),
     },
+    identified_bugs: deduplicatedBugs,
     clarifying_question:
       typeof obj.clarifying_question === 'string' &&
       obj.clarifying_question.trim()
         ? obj.clarifying_question.trim()
         : null,
-    files_to_change: (obj.files_to_change as unknown[]).map(String),
+    files_to_change: deduplicateValidationMessages(
+      (obj.files_to_change as unknown[]).map(
+        (fp) => resolveRepoPath(fp) || String(fp)
+      )
+    ),
     proposed_patch: (
       obj.proposed_patch as Array<Record<string, unknown>>
     ).map((p) => ({
-      file_path: String(p.file_path),
+      file_path: resolveRepoPath(p.file_path) || String(p.file_path),
       operation: p.operation as 'modify' | 'no_change',
       explanation: String(p.explanation),
       search_replace_blocks: Array.isArray(p.search_replace_blocks)
@@ -266,11 +376,13 @@ export function validateStructuredAgentResponse(
         typeof p.patched_content === 'string' ? p.patched_content : undefined,
     })),
     tests_to_run: {
-      targeted_tests: (ttr!.targeted_tests as unknown[]).map(String),
+      targeted_tests: deduplicateValidationMessages(
+        (ttr!.targeted_tests as unknown[]).map(String)
+      ),
       full_suite_command: String(ttr!.full_suite_command),
     },
     verification_status: obj.verification_status as VerificationStatus,
-    remaining_risks: (obj.remaining_risks as unknown[]).map(String),
+    remaining_risks: deduplicateValidationMessages(rawRemainingRisks),
   };
 
   return {

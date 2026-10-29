@@ -158,3 +158,78 @@ export function applyApprovedPatchImmutably(
 
   return Array.from(clonedMap.values()).sort((a, b) => a.path.localeCompare(b.path));
 }
+
+/**
+ * Strictly enforces the developer approval gate before applying proposed changes to exported/downloaded files.
+ * Only when `approvalStatus === 'approved_staged'` are proposed changes applied.
+ */
+export function resolveFilesForExport(
+  originalFiles: readonly RepoFile[],
+  patchBundle?: {
+    approvalStatus: 'pending_review' | 'approved_staged' | 'rejected';
+    changes: readonly FilePatchChange[];
+    unifiedPatchFile?: string;
+  } | null
+): {
+  files: RepoFile[];
+  isApprovedExport: boolean;
+  unifiedPatchToInclude: string | null;
+} {
+  const isApprovedExport = Boolean(
+    patchBundle && patchBundle.approvalStatus === 'approved_staged'
+  );
+  const files =
+    isApprovedExport && patchBundle
+      ? applyApprovedPatchImmutably(originalFiles, patchBundle.changes)
+      : originalFiles.map((f) => ({ ...f }));
+
+  return {
+    files,
+    isApprovedExport,
+    unifiedPatchToInclude:
+      isApprovedExport && patchBundle?.unifiedPatchFile
+        ? redactSecrets(patchBundle.unifiedPatchFile)
+        : null,
+  };
+}
+
+/**
+ * Resolves the content of an individual file for download, applying proposed changes
+ * ONLY when `preferCorrected` is true AND `patchBundle.approvalStatus === 'approved_staged'`.
+ */
+export function resolveIndividualFileForDownload(
+  filePath: string,
+  originalFiles: readonly RepoFile[],
+  patchBundle?: {
+    approvalStatus: 'pending_review' | 'approved_staged' | 'rejected';
+    changes: readonly FilePatchChange[];
+  } | null,
+  preferCorrected = true
+): { fileName: string; content: string; isCorrectedVersion: boolean } | null {
+  const isApproved =
+    preferCorrected &&
+    Boolean(patchBundle && patchBundle.approvalStatus === 'approved_staged');
+
+  if (isApproved && patchBundle) {
+    const change = patchBundle.changes.find((c) => c.filePath === filePath);
+    if (change) {
+      const baseName = filePath.split('/').pop() || 'corrected-file.txt';
+      return {
+        fileName: baseName,
+        content: redactSecrets(change.proposedContent),
+        isCorrectedVersion: true,
+      };
+    }
+  }
+
+  const orig = originalFiles.find((f) => f.path === filePath);
+  if (!orig) return null;
+
+  const baseName = filePath.split('/').pop() || 'file.txt';
+  return {
+    fileName: baseName,
+    content: redactSecrets(orig.content),
+    isCorrectedVersion: false,
+  };
+}
+

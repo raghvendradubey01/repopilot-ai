@@ -3,19 +3,26 @@ import {
   ChevronDown,
   ChevronRight,
   Code2,
+  Download,
   FileCode2,
   FileText,
   Folder,
   FolderOpen,
-  Laptop,
+  FolderUp,
+  Loader2,
   MessageSquare,
   PanelLeftClose,
   Plus,
   Search,
   Settings,
+  ShieldCheck,
   Upload,
 } from 'lucide-react';
-import type { RepoFile, SampleRepositoryPreset } from '../types/repopilot';
+import type {
+  RepoFile,
+  SampleRepositoryPreset,
+  ValidationReport,
+} from '../types/repopilot';
 
 export interface ConversationSessionSummary {
   id: string;
@@ -41,10 +48,16 @@ interface MinimalSidebarProps {
   conversations: ConversationSessionSummary[];
   activeConversationId: string;
   onSelectConversation: (id: string) => void;
-  onOpenSettings: (initialTab?: 'general' | 'vscode' | 'sandbox' | 'diagnostics') => void;
+  onOpenSettings: (
+    initialTab?: 'general' | 'vscode' | 'sandbox' | 'diagnostics'
+  ) => void;
   sampleRepos: SampleRepositoryPreset[];
   onSelectSampleRepo: (repoId: string) => void;
   onUploadZipFile: (file: File) => void;
+  onUploadFilesOrZip?: (files: FileList | File[]) => void;
+  isUploadingProject?: boolean;
+  validationReport?: ValidationReport | null;
+  onDownloadCorrectedZip?: () => void;
 }
 
 interface TreeDirectoryNode {
@@ -101,10 +114,16 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
   onSelectConversation,
   onOpenSettings,
   onUploadZipFile,
+  onUploadFilesOrZip,
+  isUploadingProject = false,
+  validationReport,
+  onDownloadCorrectedZip,
 }) => {
   const [explorerOpen, setExplorerOpen] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
+  const [isDraggingOverSidebar, setIsDraggingOverSidebar] =
+    useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const toggleDirectory = (dirPath: string) => {
@@ -134,13 +153,32 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
     [filteredFiles]
   );
 
-  const handleZipChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      onUploadZipFile(file);
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = e.target.files;
+    if (selectedFiles && selectedFiles.length > 0) {
+      if (onUploadFilesOrZip) {
+        onUploadFilesOrZip(selectedFiles);
+      } else {
+        onUploadZipFile(selectedFiles[0]);
+      }
       e.target.value = '';
     }
   };
+
+  const handleSidebarDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOverSidebar(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      if (onUploadFilesOrZip) {
+        onUploadFilesOrZip(e.dataTransfer.files);
+      } else {
+        onUploadZipFile(e.dataTransfer.files[0]);
+      }
+    }
+  };
+
+  const excludedCount = validationReport?.excludedFiles?.length || 0;
 
   const renderTreeNode = (
     node: TreeDirectoryNode,
@@ -211,8 +249,8 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
                 </span>
               </span>
               {(isModified || isDirty) && (
-                <span className="text-[10px] font-mono text-amber-400 shrink-0">
-                  {isDirty ? 'edited' : 'changed'}
+                <span className="text-[10px] font-mono text-emerald-400 shrink-0">
+                  {isDirty ? 'edited' : 'patched'}
                 </span>
               )}
             </button>
@@ -230,7 +268,17 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
     <aside
       aria-label="RepoPilot Sidebar"
       data-testid="left-sidebar"
-      className="w-64 sm:w-72 shrink-0 h-full bg-[#141416] border-r border-neutral-800/80 flex flex-col select-none overflow-hidden"
+      onDragOver={(e) => {
+        e.preventDefault();
+        setIsDraggingOverSidebar(true);
+      }}
+      onDragLeave={() => setIsDraggingOverSidebar(false)}
+      onDrop={handleSidebarDrop}
+      className={`w-64 sm:w-72 shrink-0 h-full bg-[#141416] border-r flex flex-col select-none overflow-hidden transition-colors ${
+        isDraggingOverSidebar
+          ? 'border-emerald-500/70 bg-emerald-950/10'
+          : 'border-neutral-800/80'
+      }`}
     >
       {/* 1. Top Header: Logo + Name + Collapse Sidebar Button */}
       <div className="shrink-0 h-14 px-3.5 flex items-center justify-between border-b border-neutral-800/60">
@@ -266,17 +314,20 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
         </button>
       </div>
 
-      {/* 3. Compact Workspace Section */}
+      {/* 3. Uploaded Project & Upload Controls Section */}
       <div className="shrink-0 px-3 py-2 border-b border-neutral-800/60">
         <div className="rounded-lg border border-neutral-800 bg-[#1A1A1E] p-2.5 flex flex-col gap-2">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-1.5 min-w-0">
-              <Laptop className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+              <FolderUp className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
               <span
+                data-testid="sidebar-project-name"
                 className="text-xs font-medium text-neutral-200 truncate"
                 title={activeProjectName}
               >
-                { isWorkspaceConnected ? activeProjectName : 'No workspace connected' }
+                {isWorkspaceConnected
+                  ? activeProjectName
+                  : 'No project uploaded'}
               </span>
             </div>
             <button
@@ -284,33 +335,68 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
               onClick={onOpenWorkspaceModal}
               className="text-[11px] font-medium text-neutral-300 hover:text-white underline underline-offset-2 shrink-0 cursor-pointer"
             >
-              {isWorkspaceConnected ? 'Change' : 'Connect'}
+              Switch
             </button>
           </div>
+
           <div className="flex items-center justify-between text-[11px] text-neutral-400">
             <span>
               {isWorkspaceConnected
-                ? `${files.length} files indexed`
-                : 'Connect VS Code project'}
+                ? `${files.length} safe file${files.length === 1 ? '' : 's'}`
+                : 'Upload ZIP or source files'}
             </span>
+            {excludedCount > 0 && (
+              <span
+                className="text-[10px] text-amber-400 flex items-center gap-1"
+                title="Secrets, .env, binaries, or build folders automatically excluded from AI context"
+              >
+                <ShieldCheck className="w-3 h-3" />
+                <span>{excludedCount} excluded</span>
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1.5 pt-0.5">
             <button
               type="button"
+              disabled={isUploadingProject}
               onClick={() => fileInputRef.current?.click()}
-              className="text-neutral-400 hover:text-neutral-200 flex items-center gap-1 cursor-pointer"
-              title="Optional: Import a project ZIP archive"
+              data-testid="sidebar-upload-button"
+              className="flex-1 py-1.5 px-2.5 rounded-md border border-neutral-700 bg-neutral-800/90 hover:bg-neutral-700 text-neutral-100 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+              title="Upload a project .zip archive or multiple individual source files"
             >
-              <Upload className="w-3 h-3" />
-              <span>Import project</span>
+              {isUploadingProject ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Upload className="w-3 h-3" />
+              )}
+              <span>
+                {isUploadingProject ? 'Validating...' : 'Upload ZIP / Files'}
+              </span>
             </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".zip"
-              onChange={handleZipChange}
-              className="hidden"
-              aria-label="Import project ZIP"
-            />
+
+            {onDownloadCorrectedZip && files.length > 0 && (
+              <button
+                type="button"
+                onClick={onDownloadCorrectedZip}
+                data-testid="sidebar-download-zip-button"
+                title="Download project ZIP with approved fixes"
+                className="p-1.5 rounded-md border border-neutral-700 bg-[#141416] hover:bg-neutral-800 text-neutral-300 hover:text-white transition-colors cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept=".zip,.py,.pyi,.ts,.tsx,.js,.jsx,.mjs,.cjs,.java,.c,.h,.cpp,.cc,.hpp,.cs,.go,.rs,.php,.rb,.swift,.kt,.sql,.html,.css,.scss,.json,.yaml,.yml,.toml,.cfg,.ini,.xml,.md,.txt,.sh"
+            onChange={handleFileInputChange}
+            className="hidden"
+            aria-label="Upload project ZIP or source files"
+          />
         </div>
       </div>
 
@@ -328,7 +414,7 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
             ) : (
               <ChevronRight className="w-3.5 h-3.5" />
             )}
-            <span>Workspace Files</span>
+            <span>Project File Tree</span>
           </span>
           <span className="font-mono text-[11px] text-neutral-500 tabular-nums">
             {files.length}
@@ -366,7 +452,7 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
 
         {explorerOpen && !isWorkspaceConnected && (
           <div className="px-3.5 pb-3 text-xs text-neutral-500">
-            Connect a VS Code workspace or import a project to browse files.
+            Upload a ZIP archive or individual source files to inspect the project tree.
           </div>
         )}
       </div>
@@ -414,7 +500,9 @@ export const MinimalSidebar: React.FC<MinimalSidebarProps> = ({
             <Settings className="w-4 h-4 text-neutral-400" />
             <span>Settings</span>
           </span>
-          <span className="text-[11px] text-neutral-500">Models &amp; Advanced</span>
+          <span className="text-[11px] text-neutral-500">
+            Models &amp; Limits
+          </span>
         </button>
       </div>
     </aside>

@@ -253,7 +253,7 @@ code .`}
                     >
                       {p.configuredOnServer
                         ? 'Configured'
-                        : 'Standby (Uses Fallback)'}
+                        : `Missing ${p.envVarName} (Setup Required)`}
                     </span>
                   </td>
                 </tr>

@@ -1,12 +1,49 @@
 import type {
+  ClassifiedImportEntry,
   FilePatchChange,
+  NormalizedProjectManifest,
   PatchValidationDiagnostic,
   ProposedFilePatchItem,
   RepoFile,
   SearchReplaceHunk,
 } from '../types/repopilot';
-import { extractFileSymbolMetadata } from './repoAnalyzer';
-import { inferLanguage } from './securityValidator';
+import {
+  buildNormalizedProjectManifest,
+  classifyPythonImports,
+  extractFileSymbolMetadata,
+  stripPythonCommentsAndStrings,
+} from './repoAnalyzer';
+import { inferLanguage, isExcludedRepositoryDirectory } from './securityValidator';
+
+/**
+ * Deduplicates validation error/warning/check messages while preserving order.
+ */
+export function deduplicateValidationMessages(
+  messages: readonly string[]
+): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of messages) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    if (!seen.has(trimmed)) {
+      seen.add(trimmed);
+      result.push(trimmed);
+    }
+  }
+  return result;
+}
+
+/**
+ * Detects whether a code string is an incomplete/truncated snippet rather than a complete file.
+ */
+export function isPartialOrExcerptedCode(content: string): boolean {
+  return (
+    content.includes('[WARNING: lines') ||
+    content.includes('omitted to fit context window]') ||
+    /^\s*#\s*\.\.\.\s*\[lines\s+\d+/m.test(content)
+  );
+}
 
 /**
  * Applies minimal search-and-replace blocks to a file's original content.
@@ -75,7 +112,7 @@ export function applySearchReplaceBlocks(
   return {
     success: errors.length === 0,
     content: current,
-    errors,
+    errors: deduplicateValidationMessages(errors),
   };
 }
 
@@ -103,37 +140,70 @@ const COMMON_STDLIB_SYMBOLS: Record<string, string> = {
 };
 
 /**
- * Performs static syntax and import validation across Python, TypeScript/JavaScript, JSON, and C-family languages.
+ * Performs static syntax and import validation strictly against the uploaded project tree.
+ * Separates findings into:
+ * - `confirmedErrors`: definite syntax or broken import errors within complete uploaded context
+ * - `possibleIssues`: non-fatal warnings or ambiguous references
+ * - `contextChecks`: checks requiring more project context (e.g., unresolved relative imports in single-file uploads)
  */
 export function checkPythonSyntaxAndImports(
   filePath: string,
   content: string,
-  allRepoFiles: readonly RepoFile[]
+  allRepoFiles: readonly RepoFile[],
+  existingManifest?: NormalizedProjectManifest
 ): {
   syntaxValid: boolean;
   importsValid: boolean;
   errors: string[];
   warnings: string[];
+  confirmedErrors: string[];
+  possibleIssues: string[];
+  contextChecks: string[];
+  isIncompleteContext: boolean;
+  contextCompletenessNote: string;
+  classifiedImports: ClassifiedImportEntry[];
 } {
-  const errors: string[] = [];
-  const warnings: string[] = [];
+  // Filter out any unrelated framework/library/virtualenv files from allRepoFiles
+  const uploadedProjectFiles = allRepoFiles.filter(
+    (f) => !isExcludedRepositoryDirectory(f.path).excluded
+  );
+  const manifest =
+    existingManifest || buildNormalizedProjectManifest(uploadedProjectFiles);
+
+  const rawConfirmedErrors: string[] = [];
+  const rawPossibleIssues: string[] = [];
+  const rawContextChecks: string[] = [];
+
+  if (manifest.isIncompleteContext) {
+    rawContextChecks.push(manifest.contextCompletenessNote);
+  }
+
   const lang = inferLanguage(filePath, content);
 
   if (lang === 'json') {
     try {
       JSON.parse(content);
     } catch (err) {
-      errors.push(
+      rawConfirmedErrors.push(
         `JSON SyntaxError in ${filePath}: ${
           err instanceof Error ? err.message : 'Invalid JSON'
         }`
       );
     }
+    const confirmedErrors = deduplicateValidationMessages(rawConfirmedErrors);
+    const possibleIssues = deduplicateValidationMessages(rawPossibleIssues);
+    const contextChecks = deduplicateValidationMessages(rawContextChecks);
     return {
-      syntaxValid: errors.length === 0,
+      syntaxValid: confirmedErrors.length === 0,
       importsValid: true,
-      errors,
-      warnings,
+      errors: confirmedErrors,
+      warnings: possibleIssues,
+      confirmedErrors,
+      possibleIssues,
+      contextChecks,
+      isIncompleteContext: manifest.isIncompleteContext,
+      contextCompletenessNote: manifest.contextCompletenessNote,
+      classifiedImports: [],
     };
   }
 
@@ -185,7 +255,7 @@ export function checkPythonSyntaxAndImports(
       }
 
       if (parenDepth < 0 || bracketDepth < 0 || braceDepth < 0) {
-        errors.push(
+        rawConfirmedErrors.push(
           `SyntaxError in ${filePath} at line ${lineIdx + 1}: unexpected closing delimiter.`
         );
         break;
@@ -193,12 +263,12 @@ export function checkPythonSyntaxAndImports(
     }
 
     if (parenDepth !== 0 || bracketDepth !== 0 || braceDepth !== 0) {
-      errors.push(
+      rawConfirmedErrors.push(
         `SyntaxError in ${filePath}: unbalanced delimiters (paren=${parenDepth}, bracket=${bracketDepth}, brace=${braceDepth}).`
       );
     }
 
-    // Check TS/JS relative imports resolve to existing repo files
+    // Check TS/JS relative imports resolve to existing uploaded files
     if (lang === 'typescript' || lang === 'javascript') {
       const meta = extractFileSymbolMetadata({
         path: filePath,
@@ -207,10 +277,14 @@ export function checkPythonSyntaxAndImports(
         language: lang,
         isTestFile: filePath.includes('test') || filePath.includes('spec'),
       });
-      const repoDir = filePath.includes('/')
-        ? filePath.slice(0, filePath.lastIndexOf('/'))
+      const normFilePath = filePath
+        .replace(/\\/g, '/')
+        .replace(/^\.\//, '')
+        .replace(/^\/+/, '');
+      const repoDir = normFilePath.includes('/')
+        ? normFilePath.slice(0, normFilePath.lastIndexOf('/'))
         : '';
-      const repoPaths = new Set(allRepoFiles.map((f) => f.path));
+      const repoPaths = new Set(manifest.normalizedFilePaths);
 
       for (const mod of meta.importedModules) {
         if (mod.startsWith('./') || mod.startsWith('../')) {
@@ -229,23 +303,57 @@ export function checkPythonSyntaxAndImports(
             !mod.startsWith('../') &&
             !candidates.some((c) => repoPaths.has(c))
           ) {
-            errors.push(
-              `ImportError in ${filePath}: relative import "${mod}" does not resolve to any file in the repository.`
-            );
+            if (manifest.isIncompleteContext) {
+              rawContextChecks.push(
+                `Context check in ${filePath}: relative import "${mod}" targets a file not present in this single-file upload.`
+              );
+            } else {
+              rawConfirmedErrors.push(
+                `ImportError in ${filePath}: relative import "${mod}" does not resolve to any file in the repository.`
+              );
+            }
           }
         }
       }
     }
 
+    const confirmedErrors = deduplicateValidationMessages(rawConfirmedErrors);
+    const possibleIssues = deduplicateValidationMessages(rawPossibleIssues);
+    const contextChecks = deduplicateValidationMessages(rawContextChecks);
     const syntaxValid =
-      errors.filter((e) => e.includes('SyntaxError')).length === 0;
+      confirmedErrors.filter((e) => e.includes('SyntaxError')).length === 0;
     const importsValid =
-      errors.filter((e) => e.includes('ImportError')).length === 0;
-    return { syntaxValid, importsValid, errors, warnings };
+      confirmedErrors.filter((e) => e.includes('ImportError')).length === 0;
+    return {
+      syntaxValid,
+      importsValid,
+      errors: confirmedErrors,
+      warnings: possibleIssues,
+      confirmedErrors,
+      possibleIssues,
+      contextChecks,
+      isIncompleteContext: manifest.isIncompleteContext,
+      contextCompletenessNote: manifest.contextCompletenessNote,
+      classifiedImports: [],
+    };
   }
 
   if (!filePath.endsWith('.py')) {
-    return { syntaxValid: true, importsValid: true, errors, warnings };
+    const confirmedErrors = deduplicateValidationMessages(rawConfirmedErrors);
+    const possibleIssues = deduplicateValidationMessages(rawPossibleIssues);
+    const contextChecks = deduplicateValidationMessages(rawContextChecks);
+    return {
+      syntaxValid: true,
+      importsValid: true,
+      errors: confirmedErrors,
+      warnings: possibleIssues,
+      confirmedErrors,
+      possibleIssues,
+      contextChecks,
+      isIncompleteContext: manifest.isIncompleteContext,
+      contextCompletenessNote: manifest.contextCompletenessNote,
+      classifiedImports: [],
+    };
   }
 
   const lines = content.replace(/\r\n/g, '\n').split('\n');
@@ -289,7 +397,7 @@ export function checkPythonSyntaxAndImports(
     }
 
     if (parenDepth < 0 || bracketDepth < 0 || braceDepth < 0) {
-      errors.push(
+      rawConfirmedErrors.push(
         `SyntaxError in ${filePath} at line ${lineIdx + 1}: unexpected closing delimiter.`
       );
       break;
@@ -305,125 +413,182 @@ export function checkPythonSyntaxAndImports(
       !codeOnly.trim().endsWith(':') &&
       !codeOnly.trim().endsWith('\\')
     ) {
-      errors.push(
+      rawConfirmedErrors.push(
         `SyntaxError in ${filePath} at line ${lineIdx + 1}: compound statement is missing a trailing colon ':'.`
       );
     }
   }
 
   if (parenDepth !== 0 || bracketDepth !== 0 || braceDepth !== 0) {
-    errors.push(
+    rawConfirmedErrors.push(
       `SyntaxError in ${filePath}: unbalanced parentheses/brackets (paren=${parenDepth}, bracket=${bracketDepth}, brace=${braceDepth}).`
     );
   }
 
   if (inTripleDouble || inTripleSingle) {
-    errors.push(
+    rawConfirmedErrors.push(
       `SyntaxError in ${filePath}: unterminated triple-quoted string literal.`
     );
   }
 
-  const syntaxValid = errors.length === 0;
+  const syntaxValid = rawConfirmedErrors.length === 0;
 
-  // 2. Check imports & symbol references
-  const meta = extractFileSymbolMetadata({
-    path: filePath,
+  // 2. Check imports & symbol references against the complete relevant file and normalized manifest
+  const normTargetPath = filePath
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/^\/+/, '');
+  const fullRepoFile = uploadedProjectFiles.find(
+    (f) =>
+      f.path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '') ===
+      normTargetPath
+  );
+
+  const partialSnippet = isPartialOrExcerptedCode(content);
+
+  const currentFileObj: RepoFile = {
+    path: normTargetPath,
     content,
     sizeBytes: content.length,
     language: 'python',
-    isTestFile: filePath.includes('test'),
-  });
+    isTestFile: normTargetPath.includes('test'),
+  };
+
+  const meta = extractFileSymbolMetadata(currentFileObj);
+
+  // If `content` was a partial snippet but the full file exists in `uploadedProjectFiles`,
+  // merge the complete file's imports & definitions so we never falsely report missing imports.
+  const fullMeta =
+    fullRepoFile && fullRepoFile.content.length > content.length
+      ? extractFileSymbolMetadata(fullRepoFile)
+      : null;
 
   const importedEverything = new Set<string>([
     ...meta.importedSymbols,
-    ...meta.importedModules.map((m) => m.split('.')[0]),
+    ...meta.importedModules.map((m) => m.replace(/^\.+/, '').split('.')[0]),
     ...meta.definedFunctions,
     ...meta.definedClasses,
+    ...(meta.definedVariables || []),
+    ...(fullMeta ? fullMeta.importedSymbols : []),
+    ...(fullMeta
+      ? fullMeta.importedModules.map((m) => m.replace(/^\.+/, '').split('.')[0])
+      : []),
+    ...(fullMeta ? fullMeta.definedFunctions : []),
+    ...(fullMeta ? fullMeta.definedClasses : []),
+    ...(fullMeta ? fullMeta.definedVariables || [] : []),
   ]);
 
-  const repoDir = filePath.includes('/')
-    ? filePath.slice(0, filePath.lastIndexOf('/'))
-    : '';
-  const repoFilePaths = new Set(allRepoFiles.map((f) => f.path));
+  const classifiedImports = classifyPythonImports(
+    currentFileObj,
+    uploadedProjectFiles,
+    manifest
+  );
 
-  for (const mod of meta.importedModules) {
-    if (mod.startsWith('.')) {
-      const cleanRel = mod.replace(/^\.+/, '');
-      if (cleanRel) {
-        const candidate1 = repoDir
-          ? `${repoDir}/${cleanRel.replace(/\./g, '/')}.py`
-          : `${cleanRel.replace(/\./g, '/')}.py`;
-        const candidate2 = repoDir
-          ? `${repoDir}/${cleanRel.replace(/\./g, '/')}/__init__.py`
-          : `${cleanRel.replace(/\./g, '/')}/__init__.py`;
-        if (!repoFilePaths.has(candidate1) && !repoFilePaths.has(candidate2)) {
-          errors.push(
-            `ImportError in ${filePath}: relative import "${mod}" does not resolve to any file in the repository.`
+  for (const imp of classifiedImports) {
+    if (imp.category === 'package_relative') {
+      if (imp.resolutionStatus === 'resolved_local') {
+        continue;
+      }
+      if (
+        imp.resolutionStatus === 'unresolved_missing_context' ||
+        manifest.isIncompleteContext
+      ) {
+        rawContextChecks.push(
+          `Context check in ${filePath}: package-relative import "${imp.rawSpecifier}" cannot be verified because target sibling/package files were not included in the upload.`
+        );
+      } else {
+        rawConfirmedErrors.push(
+          `ImportError in ${filePath}: relative import "${imp.rawSpecifier}" does not resolve to any file in the uploaded project manifest.`
+        );
+      }
+    }
+  }
+
+  // Strip comments and string literals (including triple-quoted docstrings) before checking symbol usage
+  const strippedActiveCode = stripPythonCommentsAndStrings(content);
+
+  if (partialSnippet) {
+    rawContextChecks.push(
+      `Context check in ${filePath}: code appears to be a partial or excerpted snippet; skipping missing-import inference on omitted sections.`
+    );
+  } else {
+    for (const [sym, requiredMod] of Object.entries(COMMON_STDLIB_SYMBOLS)) {
+      // Negative lookbehind (?<![.\w]) ensures attribute/method accesses like `self.json.dumps`
+      // or `app.json` or `obj.Path` are never mistaken for top-level module/symbol references.
+      const regex =
+        sym === 'math' || sym === 'json' || sym === 're' || sym === 'pytest'
+          ? new RegExp(`(?<![.\\w])${sym}\\.[A-Za-z_][A-Za-z0-9_]*`, 'g')
+          : new RegExp(`(?:@|(?<![.\\w]))${sym}\\b`, 'g');
+
+      if (regex.test(strippedActiveCode)) {
+        const hasSymbolOrMod =
+          importedEverything.has(sym) ||
+          importedEverything.has(requiredMod) ||
+          meta.importedModules.includes(requiredMod) ||
+          (fullMeta ? fullMeta.importedModules.includes(requiredMod) : false);
+        if (!hasSymbolOrMod) {
+          rawConfirmedErrors.push(
+            `NameError / Missing Import in ${filePath}: symbol "${sym}" is used without importing "${requiredMod}".`
+          );
+        }
+      }
+    }
+
+    for (const otherFile of uploadedProjectFiles) {
+      const normOther = otherFile.path
+        .replace(/\\/g, '/')
+        .replace(/^\.\//, '')
+        .replace(/^\/+/, '');
+      if (normOther === normTargetPath || otherFile.language !== 'python') {
+        continue;
+      }
+      const otherMeta = extractFileSymbolMetadata(otherFile);
+      for (const exportedSym of [
+        ...otherMeta.definedFunctions,
+        ...otherMeta.definedClasses,
+      ]) {
+        if (exportedSym.startsWith('_') || exportedSym.startsWith('test_')) {
+          continue;
+        }
+        if (
+          meta.calledSymbols.includes(exportedSym) &&
+          !importedEverything.has(exportedSym)
+        ) {
+          rawConfirmedErrors.push(
+            `NameError / Missing Import in ${filePath}: repository symbol "${exportedSym}" (defined in ${otherFile.path}) is called without being imported.`
           );
         }
       }
     }
   }
 
-  const activeCodeLines = lines
-    .filter((l) => !l.trim().startsWith('#'))
-    .map((l) => l.split('#')[0]);
-  const activeCode = activeCodeLines.join('\n');
-
-  for (const [sym, requiredMod] of Object.entries(COMMON_STDLIB_SYMBOLS)) {
-    const regex =
-      sym === 'math' || sym === 'json' || sym === 're' || sym === 'pytest'
-        ? new RegExp(`\\b${sym}\\.[A-Za-z_][A-Za-z0-9_]*`, 'g')
-        : new RegExp(`(?:@|\\b)${sym}\\b`, 'g');
-
-    if (regex.test(activeCode)) {
-      const hasSymbolOrMod =
-        importedEverything.has(sym) ||
-        importedEverything.has(requiredMod) ||
-        meta.importedModules.includes(requiredMod);
-      if (!hasSymbolOrMod) {
-        errors.push(
-          `NameError / Missing Import in ${filePath}: symbol "${sym}" is used without importing "${requiredMod}".`
-        );
-      }
-    }
-  }
-
-  for (const otherFile of allRepoFiles) {
-    if (otherFile.path === filePath || otherFile.language !== 'python') continue;
-    const otherMeta = extractFileSymbolMetadata(otherFile);
-    for (const exportedSym of [
-      ...otherMeta.definedFunctions,
-      ...otherMeta.definedClasses,
-    ]) {
-      if (exportedSym.startsWith('_') || exportedSym.startsWith('test_'))
-        continue;
-      if (
-        meta.calledSymbols.includes(exportedSym) &&
-        !importedEverything.has(exportedSym)
-      ) {
-        errors.push(
-          `NameError / Missing Import in ${filePath}: repository symbol "${exportedSym}" (defined in ${otherFile.path}) is called without being imported.`
-        );
-      }
-    }
-  }
+  const confirmedErrors = deduplicateValidationMessages(rawConfirmedErrors);
+  const possibleIssues = deduplicateValidationMessages(rawPossibleIssues);
+  const contextChecks = deduplicateValidationMessages(rawContextChecks);
 
   const importsValid =
-    errors.filter((e) => e.includes('Import') || e.includes('NameError'))
-      .length === 0;
+    confirmedErrors.filter(
+      (e) => e.includes('ImportError') || e.includes('NameError')
+    ).length === 0;
 
   return {
     syntaxValid,
     importsValid,
-    errors,
-    warnings,
+    errors: confirmedErrors,
+    warnings: possibleIssues,
+    confirmedErrors,
+    possibleIssues,
+    contextChecks,
+    isIncompleteContext: manifest.isIncompleteContext,
+    contextCompletenessNote: manifest.contextCompletenessNote,
+    classifiedImports,
   };
 }
 
 /**
- * Validates that all proposed patches target real files in the repository,
+ * Validates that all proposed patches target real uploaded files in the repository,
  * apply cleanly without hunk conflicts, and pass language syntax & import checks.
+ * Does NOT reject valid patches because an unrelated dependency file is absent.
  */
 export function validateProposedPatches(
   originalFiles: readonly RepoFile[],
@@ -434,10 +599,24 @@ export function validateProposedPatches(
   diagnostics: PatchValidationDiagnostic[];
   errors: string[];
 } {
-  const fileMap = new Map(originalFiles.map((f) => [f.path, f]));
+  const uploadedFiles = originalFiles.filter(
+    (f) => !isExcludedRepositoryDirectory(f.path).excluded
+  );
+  const manifest = buildNormalizedProjectManifest(uploadedFiles);
+
+  const fileMap = new Map<string, RepoFile>();
+  for (const f of uploadedFiles) {
+    fileMap.set(f.path, f);
+    const norm = f.path
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '')
+      .replace(/^\/+/, '');
+    fileMap.set(norm, f);
+  }
+
   const changes: FilePatchChange[] = [];
   const diagnostics: PatchValidationDiagnostic[] = [];
-  const globalErrors: string[] = [];
+  const rawGlobalErrors: string[] = [];
 
   // First build all candidate file contents so cross-file checks see simultaneous multi-file edits
   const candidateContents = new Map<string, string>();
@@ -454,10 +633,16 @@ export function validateProposedPatches(
       continue;
     }
 
-    const existingFile = fileMap.get(item.file_path);
+    const normTarget = item.file_path
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '')
+      .replace(/^\/+/, '');
+    const existingFile =
+      fileMap.get(item.file_path) || fileMap.get(normTarget);
+
     if (!existingFile) {
       const errMsg = `Invalid patch target "${item.file_path}": file does not exist in the repository. Inventing file paths is prohibited.`;
-      globalErrors.push(errMsg);
+      rawGlobalErrors.push(errMsg);
       diagnostics.push({
         filePath: item.file_path,
         valid: false,
@@ -466,6 +651,9 @@ export function validateProposedPatches(
         importsValid: false,
         errors: [errMsg],
         warnings: [],
+        confirmedErrors: [errMsg],
+        possibleIssues: [],
+        contextChecks: [],
       });
       continue;
     }
@@ -498,7 +686,15 @@ export function validateProposedPatches(
       );
     }
 
-    candidateContents.set(item.file_path, patchedContent);
+    // Ensure the proposed patch actually has valid applicable content
+    if (appliesCleanly && !patchedContent.trim()) {
+      appliesCleanly = false;
+      fileErrors.push(
+        `Patch for "${item.file_path}" resulted in empty file content.`
+      );
+    }
+
+    candidateContents.set(existingFile.path, patchedContent);
     perFileResults.push({
       item,
       existingFile,
@@ -508,52 +704,103 @@ export function validateProposedPatches(
     });
   }
 
-  const simulatedRepo = originalFiles.map((f) =>
+  const simulatedRepo = uploadedFiles.map((f) =>
     candidateContents.has(f.path)
       ? { ...f, content: candidateContents.get(f.path)! }
       : f
   );
 
   for (const entry of perFileResults) {
-    const staticCheck = checkPythonSyntaxAndImports(
-      entry.item.file_path,
-      entry.patchedContent,
-      simulatedRepo
+    // Check baseline original file so pre-existing unresolved imports in an uploaded file
+    // do not cause a valid bug-fix patch to be rejected when a dependency file is absent.
+    const baselineCheck = checkPythonSyntaxAndImports(
+      entry.existingFile.path,
+      entry.existingFile.content,
+      uploadedFiles,
+      manifest
     );
-    entry.fileErrors.push(...staticCheck.errors);
+    const baselineImportErrors = new Set(
+      baselineCheck.confirmedErrors.filter(
+        (e) => e.includes('ImportError') || e.includes('NameError')
+      )
+    );
+
+    const staticCheck = checkPythonSyntaxAndImports(
+      entry.existingFile.path,
+      entry.patchedContent,
+      simulatedRepo,
+      manifest
+    );
+
+    const blockingStaticErrors: string[] = [];
+    const nonBlockingWarnings: string[] = [...staticCheck.possibleIssues];
+    const contextChecks: string[] = [...staticCheck.contextChecks];
+
+    for (const err of staticCheck.confirmedErrors) {
+      const isImportError =
+        err.includes('ImportError') || err.includes('NameError');
+      if (isImportError && baselineImportErrors.has(err)) {
+        // Pre-existing unresolved import in the uploaded file — record as context check, do not reject patch
+        contextChecks.push(
+          `Pre-existing import notice: ${err} (present in original upload because target dependency file is absent).`
+        );
+      } else {
+        blockingStaticErrors.push(err);
+      }
+    }
+
+    const deduplicatedFileErrors = deduplicateValidationMessages([
+      ...entry.fileErrors,
+      ...blockingStaticErrors,
+    ]);
+    const deduplicatedWarnings =
+      deduplicateValidationMessages(nonBlockingWarnings);
+    const deduplicatedContextChecks =
+      deduplicateValidationMessages(contextChecks);
+
+    const effectiveImportsValid =
+      blockingStaticErrors.filter(
+        (e) => e.includes('ImportError') || e.includes('NameError')
+      ).length === 0;
 
     const isFileValid =
       entry.appliesCleanly &&
       staticCheck.syntaxValid &&
-      staticCheck.importsValid;
+      effectiveImportsValid;
 
     diagnostics.push({
-      filePath: entry.item.file_path,
+      filePath: entry.existingFile.path,
       valid: isFileValid,
       appliesCleanly: entry.appliesCleanly,
       syntaxValid: staticCheck.syntaxValid,
-      importsValid: staticCheck.importsValid,
-      errors: entry.fileErrors,
-      warnings: staticCheck.warnings,
+      importsValid: effectiveImportsValid,
+      errors: deduplicatedFileErrors,
+      warnings: deduplicatedWarnings,
+      confirmedErrors: deduplicatedFileErrors,
+      possibleIssues: deduplicatedWarnings,
+      contextChecks: deduplicatedContextChecks,
     });
 
     if (!isFileValid) {
-      globalErrors.push(...entry.fileErrors);
+      rawGlobalErrors.push(...deduplicatedFileErrors);
     }
 
     changes.push({
-      filePath: entry.item.file_path,
+      filePath: entry.existingFile.path,
       explanation:
-        entry.item.explanation || `Updated ${entry.item.file_path}`,
+        entry.item.explanation || `Updated ${entry.existingFile.path}`,
       originalContent: entry.existingFile.content,
       proposedContent: entry.patchedContent,
     });
   }
 
+  const finalErrors = deduplicateValidationMessages(rawGlobalErrors);
+
   return {
-    allValid: globalErrors.length === 0,
+    allValid: finalErrors.length === 0,
     changes,
     diagnostics,
-    errors: globalErrors,
+    errors: finalErrors,
   };
 }
+

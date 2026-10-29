@@ -6,10 +6,13 @@ import {
   validateRepositoryEntries,
   redactSecrets,
 } from './securityValidator';
+import JSZip from 'jszip';
 import {
   buildFileDiffResult,
   applyApprovedPatchImmutably,
   buildCombinedUnifiedPatch,
+  resolveFilesForExport,
+  resolveIndividualFileForDownload,
 } from './diffEngine';
 import {
   SAMPLE_REPOSITORIES,
@@ -18,16 +21,29 @@ import {
   buildDeterministicAnalysisAndPatch,
 } from './sampleRepos';
 import {
+  buildFocusedFileExcerpt,
+  buildNormalizedProjectManifest,
+  classifyPythonImports,
   detectLanguageToolchain,
   extractFileSymbolMetadata,
   selectContextForTask,
 } from './repoAnalyzer';
 import {
   checkPythonSyntaxAndImports,
+  deduplicateValidationMessages,
   validateProposedPatches,
 } from './patchValidator';
-import { executeModelQueryWithOneRetry } from './responseValidator';
+import {
+  executeModelQueryWithOneRetry,
+  validateStructuredAgentResponse,
+} from './responseValidator';
 import { runSandboxAndRepairLoop } from '../server/sandboxRunner';
+import {
+  callOpenAICompatibleProvider,
+  checkProviderCredentials,
+  generateAnalysisAndPatch,
+  getServerAIProviders,
+} from '../server/aiProviders';
 import type { ProposedPatchBundle, RepoFile } from '../types/repopilot';
 import {
   buildContextPrivacyManifest,
@@ -594,5 +610,1043 @@ test('Scenario 17: Webview message validation blocks arbitrary paths, unknown ty
     false
   );
 });
+
+test('Scenario 18: Multi-file upload validation excludes secrets/.env/binaries by default and enforces configurable limits', () => {
+  const mixedUploadEntries = [
+    {
+      path: 'src/app.py',
+      content: 'def add(a: int, b: int) -> int:\n    return a + b\n',
+      uncompressedBytes: 50,
+    },
+    {
+      path: 'tests/test_app.py',
+      content: 'from src.app import add\ndef test_add():\n    assert add(2, 3) == 5\n',
+      uncompressedBytes: 66,
+    },
+    {
+      path: '.env',
+      content: 'DATABASE_URL="postgres://secret"\n',
+      uncompressedBytes: 34,
+    },
+    {
+      path: 'node_modules/pkg/index.js',
+      content: 'module.exports = {};\n',
+      uncompressedBytes: 21,
+    },
+    {
+      path: 'assets/banner.png',
+      content: '\u0000PNG_BINARY',
+      uncompressedBytes: 120,
+    },
+  ];
+
+  // With excludeSecretsAndBinariesByDefault: true, .env, node_modules, and binary files are safely excluded while valid source files are accepted
+  const safeBatch = validateRepositoryEntries('uploaded-project', mixedUploadEntries, {
+    excludeSecretsAndBinariesByDefault: true,
+    maxFileCount: 10,
+    maxFileBytes: 64 * 1024,
+    maxArchiveBytes: 512 * 1024,
+  });
+
+  assert.equal(safeBatch.report.valid, true);
+  assert.equal(safeBatch.acceptedFiles.length, 2);
+  assert.deepEqual(
+    safeBatch.acceptedFiles.map((f) => f.path),
+    ['src/app.py', 'tests/test_app.py']
+  );
+  assert.ok(
+    safeBatch.report.excludedFiles &&
+      safeBatch.report.excludedFiles.length === 3
+  );
+
+  // Configurable maxFileCount limit rejects upload when exceeded
+  const countExceeded = validateRepositoryEntries('uploaded-project', mixedUploadEntries, {
+    excludeSecretsAndBinariesByDefault: true,
+    maxFileCount: 1,
+  });
+  assert.equal(countExceeded.report.valid, false);
+  assert.ok(countExceeded.report.issues.some((i) => i.code === 'TOO_MANY_FILES'));
+});
+
+test('Scenario 19: Structured bug reports include file paths, line references, severity, and missing AI credentials throw clear configuration error', async () => {
+  const billingRepo = SAMPLE_REPOSITORIES[0];
+  const analysis = buildDeterministicAnalysisAndPatch(
+    billingRepo.id,
+    billingRepo.files,
+    billingRepo.defaultTask,
+    'Test Provider',
+    'test-model',
+    'initial'
+  );
+
+  assert.ok(
+    analysis.plan.identifiedBugs && analysis.plan.identifiedBugs.length > 0,
+    'Analysis plan must include structured identifiedBugs'
+  );
+  const firstBug = analysis.plan.identifiedBugs![0];
+  assert.equal(firstBug.file_path, 'billing/calculator.py');
+  assert.ok(firstBug.line_reference.startsWith('L'));
+  assert.equal(firstBug.severity, 'high');
+  assert.ok(firstBug.explanation.length > 10);
+  assert.ok(firstBug.recommended_fix.length > 10);
+
+  // Verify that requesting an unconfigured provider with requireRealCredentials: true throws a clear Configuration Error and never fakes a response
+  const nebiusCreds = checkProviderCredentials('nebius');
+  if (!nebiusCreds.configured) {
+    await assert.rejects(
+      async () => {
+        await generateAnalysisAndPatch({
+          providerId: 'nebius',
+          repoId: billingRepo.id,
+          files: billingRepo.files,
+          taskDescription: billingRepo.defaultTask,
+          requireRealCredentials: true,
+        });
+      },
+      /Configuration Error/
+    );
+  }
+});
+
+test('Scenario 20: Single Python file upload (app.py with Flask relative imports, Path, and json) produces zero false-positive errors and marks incomplete project context', () => {
+  const flaskAppPyContent = [
+    'from __future__ import annotations',
+    'import typing as t',
+    'from pathlib import (',
+    '    Path,',
+    ')',
+    'from werkzeug.wrappers import Response as BaseResponse',
+    'from . import cli, json',
+    'from .config import Config',
+    'from .ctx import AppContext, RequestContext',
+    'from .globals import _cv_app, current_app, g, request, session',
+    'from .helpers import get_debug_flag, get_flashed_messages, get_load_dotenv',
+    'from .sansio.app import App',
+    'from .sessions import SecureCookieSessionInterface, SessionInterface',
+    'from .signals import appcontext_tearing_down, got_request_exception, request_finished',
+    'from .templating import DispatchingJinjaLoader, Environment',
+    'from .wrappers import Request, Response',
+    '',
+    'if t.TYPE_CHECKING:',
+    '    from .testing import FlaskClient, FlaskCliRunner',
+    '    from .debughelpers import attach_enctype_error_multidict',
+    '',
+    'class Flask(App):',
+    '    """The Flask object implements a WSGI application.',
+    '    Example usage in docstring: json.dumps({"ok": True}) and Path("/tmp")',
+    '    """',
+    '    def open_resource(self, resource: str) -> str:',
+    '        target = Path(self.root_path) / resource',
+    '        return str(target)',
+    '',
+    '    def dump_payload(self, data: dict[str, t.Any]) -> str:',
+    '        # Calling self.json.dumps must never be mistaken for an unimported stdlib json module',
+    '        return self.json.dumps(data)',
+    '',
+  ].join('\n');
+
+  const uploadValidation = validateRepositoryEntries('flask-single-file', [
+    {
+      path: 'app.py',
+      content: flaskAppPyContent,
+      uncompressedBytes: flaskAppPyContent.length,
+    },
+  ]);
+
+  assert.equal(uploadValidation.report.valid, true);
+  assert.equal(uploadValidation.report.isIncompleteContext, true);
+  assert.ok(
+    uploadValidation.report.contextCompletenessNote?.includes(
+      'Incomplete project context'
+    )
+  );
+
+  const singleRepoFiles = uploadValidation.acceptedFiles;
+  const checkResult = checkPythonSyntaxAndImports(
+    'app.py',
+    flaskAppPyContent,
+    singleRepoFiles
+  );
+
+  // Must NOT report .ctx, .globals, .helpers, .sansio.app, .sessions, .signals, .templating, .wrappers, .testing, .debughelpers, Path, or json as confirmed errors
+  assert.equal(checkResult.syntaxValid, true);
+  assert.equal(checkResult.importsValid, true);
+  assert.deepEqual(checkResult.errors, []);
+  assert.deepEqual(checkResult.confirmedErrors, []);
+  assert.equal(checkResult.isIncompleteContext, true);
+
+  // Unresolved package-relative imports in a single-file upload must be categorized under contextChecks
+  assert.ok(
+    checkResult.contextChecks.some((c) => c.includes('.ctx')),
+    'Expected .ctx to be recorded under contextChecks'
+  );
+  assert.ok(
+    checkResult.contextChecks.some((c) => c.includes('.sansio.app')),
+    'Expected .sansio.app to be recorded under contextChecks'
+  );
+  assert.ok(
+    checkResult.contextChecks.some((c) => c.includes('.debughelpers')),
+    'Expected .debughelpers to be recorded under contextChecks'
+  );
+
+  // Proposing a valid patch on app.py must succeed and NOT be rejected because .ctx or other sibling files are absent
+  const patchResult = validateProposedPatches(singleRepoFiles, [
+    {
+      file_path: 'app.py',
+      operation: 'modify',
+      explanation: 'Normalize resource path with .resolve()',
+      search_replace_blocks: [
+        {
+          search: '        target = Path(self.root_path) / resource',
+          replace: '        target = (Path(self.root_path) / resource).resolve()',
+        },
+      ],
+    },
+  ]);
+
+  assert.equal(
+    patchResult.allValid,
+    true,
+    `Expected valid patch on single-file app.py to pass, but got errors: ${patchResult.errors.join('; ')}`
+  );
+  assert.equal(patchResult.changes.length, 1);
+  assert.ok(patchResult.changes[0].proposedContent.includes('.resolve()'));
+});
+
+test('Scenario 21: ZIP upload with multiple local modules builds normalized manifest, resolves package-relative & local imports, and excludes framework/site-packages files', () => {
+  const zipRepoFiles: RepoFile[] = [
+    {
+      path: 'my_pkg/__init__.py',
+      content: 'from .app import create_app\n',
+      sizeBytes: 28,
+      language: 'python',
+      isTestFile: false,
+    },
+    {
+      path: 'my_pkg/ctx.py',
+      content: 'class AppContext:\n    pass\n',
+      sizeBytes: 27,
+      language: 'python',
+      isTestFile: false,
+    },
+    {
+      path: 'my_pkg/sansio/__init__.py',
+      content: '',
+      sizeBytes: 0,
+      language: 'python',
+      isTestFile: false,
+    },
+    {
+      path: 'my_pkg/sansio/app.py',
+      content: 'class App:\n    pass\n',
+      sizeBytes: 20,
+      language: 'python',
+      isTestFile: false,
+    },
+    {
+      path: 'my_pkg/app.py',
+      content: [
+        'from pathlib import Path',
+        'import json',
+        'import werkzeug',
+        'from .ctx import AppContext',
+        'from .sansio.app import App',
+        'from my_pkg.ctx import AppContext as DirectCtx',
+        '',
+        'def create_app() -> App:',
+        '    p = Path(".")',
+        '    _ = json.dumps({"root": str(p)})',
+        '    return App()',
+        '',
+      ].join('\n'),
+      sizeBytes: 260,
+      language: 'python',
+      isTestFile: false,
+    },
+    // Unrelated virtualenv / site-packages file that must be excluded from manifest
+    {
+      path: '.venv/lib/python3.11/site-packages/flask/app.py',
+      content: 'from .ctx import AppContext\n',
+      sizeBytes: 28,
+      language: 'python',
+      isTestFile: false,
+    },
+  ];
+
+  const manifest = buildNormalizedProjectManifest(zipRepoFiles, {
+    projectName: 'my_pkg_zip',
+    uploadMode: 'zip_archive',
+  });
+
+  // Unrelated framework file inside .venv/site-packages must be excluded
+  assert.ok(
+    !manifest.normalizedFilePaths.some((p) => p.includes('site-packages')),
+    'site-packages files must never be included in normalized project manifest'
+  );
+  assert.ok(
+    manifest.excludedFrameworkOrEnvPaths.includes(
+      '.venv/lib/python3.11/site-packages/flask/app.py'
+    )
+  );
+  assert.equal(manifest.isIncompleteContext, false);
+  assert.equal(manifest.pythonModuleMap['my_pkg.ctx'], 'my_pkg/ctx.py');
+  assert.equal(
+    manifest.pythonModuleMap['my_pkg.sansio.app'],
+    'my_pkg/sansio/app.py'
+  );
+
+  // Check import classification on my_pkg/app.py
+  const appFile = zipRepoFiles.find((f) => f.path === 'my_pkg/app.py')!;
+  const classified = classifyPythonImports(appFile, zipRepoFiles, manifest);
+
+  const bySpec = new Map(classified.map((c) => [c.rawSpecifier, c]));
+  assert.equal(bySpec.get('pathlib')?.category, 'stdlib');
+  assert.equal(bySpec.get('json')?.category, 'stdlib');
+  assert.equal(bySpec.get('werkzeug')?.category, 'third_party');
+  assert.equal(bySpec.get('.ctx')?.category, 'package_relative');
+  assert.equal(bySpec.get('.ctx')?.resolvedFilePath, 'my_pkg/ctx.py');
+  assert.equal(bySpec.get('.sansio.app')?.category, 'package_relative');
+  assert.equal(
+    bySpec.get('.sansio.app')?.resolvedFilePath,
+    'my_pkg/sansio/app.py'
+  );
+  assert.equal(bySpec.get('my_pkg.ctx')?.category, 'local_module');
+  assert.equal(bySpec.get('my_pkg.ctx')?.resolvedFilePath, 'my_pkg/ctx.py');
+
+  // Static check on my_pkg/app.py must pass with 0 errors
+  const validCheck = checkPythonSyntaxAndImports(
+    'my_pkg/app.py',
+    appFile.content,
+    zipRepoFiles,
+    manifest
+  );
+  assert.equal(validCheck.syntaxValid, true);
+  assert.equal(validCheck.importsValid, true);
+  assert.deepEqual(validCheck.confirmedErrors, []);
+
+  // If a file in a complete multi-file ZIP imports a nonexistent relative module `.nonexistent_sibling`,
+  // it IS reported under confirmedErrors
+  const brokenContent = `${appFile.content}\nfrom .nonexistent_sibling import Foo\n`;
+  const brokenCheck = checkPythonSyntaxAndImports(
+    'my_pkg/app.py',
+    brokenContent,
+    zipRepoFiles,
+    manifest
+  );
+  assert.equal(brokenCheck.importsValid, false);
+  assert.ok(
+    brokenCheck.confirmedErrors.some((e) => e.includes('.nonexistent_sibling'))
+  );
+});
+
+test('Scenario 22: Excerpts preserve imports past line 30 and partial snippets never falsely infer missing Path or json', () => {
+  // Build a 200-line Python file where `from pathlib import Path` and `import json` appear around line 55
+  const headerComments = Array.from(
+    { length: 50 },
+    (_, i) => `# Header license comment line ${i + 1}`
+  );
+  const importSection = [
+    'from pathlib import (',
+    '    Path,',
+    ')',
+    'import json',
+  ];
+  const bodyLines = Array.from(
+    { length: 140 },
+    (_, i) => `def helper_${i + 1}(x: int) -> int:\n    return x + ${i + 1}`
+  );
+  const tailLines = [
+    'def load_config(p: str) -> dict:',
+    '    target = Path(p)',
+    '    return json.loads(target.read_text())',
+  ];
+
+  const largePyContent = [
+    ...headerComments,
+    ...importSection,
+    ...bodyLines,
+    ...tailLines,
+  ].join('\n');
+
+  const largeFile: RepoFile = {
+    path: 'pkg/large_app.py',
+    content: largePyContent,
+    sizeBytes: largePyContent.length,
+    language: 'python',
+    isTestFile: false,
+  };
+
+  // 1. Verify buildFocusedFileExcerpt preserves the imports at lines 51-54 even though they are past line 30
+  const excerptInfo = buildFocusedFileExcerpt(largeFile, ['load_config']);
+  assert.ok(
+    excerptInfo.content.includes('Path') &&
+      excerptInfo.content.includes('import json'),
+    'Focused file excerpt must preserve all import statements even when located past line 30'
+  );
+
+  // 2. Verify that checking an incomplete snippet with an omission marker never infers missing Path or json
+  const truncatedSnippetWithoutImports = [
+    '# ... [WARNING: lines 1-60 omitted to fit context window] ...',
+    'def load_config(p: str) -> dict:',
+    '    target = Path(p)',
+    '    return json.loads(target.read_text())',
+  ].join('\n');
+
+  const snippetCheck = checkPythonSyntaxAndImports(
+    'pkg/large_app.py',
+    truncatedSnippetWithoutImports,
+    [largeFile]
+  );
+  assert.equal(snippetCheck.importsValid, true);
+  assert.deepEqual(snippetCheck.confirmedErrors, []);
+  assert.ok(
+    snippetCheck.contextChecks.some((c) =>
+      c.includes('partial or excerpted snippet')
+    )
+  );
+});
+
+test('Scenario 23: Repeated validation errors and duplicate imports are deduplicated', () => {
+  const rawDuplicates = [
+    'ImportError in app.py: relative import ".ctx" does not resolve to any file in the uploaded project manifest.',
+    'ImportError in app.py: relative import ".ctx" does not resolve to any file in the uploaded project manifest.',
+    'NameError / Missing Import in app.py: symbol "Path" is used without importing "pathlib".',
+    'NameError / Missing Import in app.py: symbol "Path" is used without importing "pathlib".',
+  ];
+
+  const deduped = deduplicateValidationMessages(rawDuplicates);
+  assert.equal(deduped.length, 2);
+
+  // Also test a file that imports the same relative module twice (e.g., runtime and TYPE_CHECKING)
+  // in a multi-file repo where that relative module is missing
+  const multiFiles: RepoFile[] = [
+    {
+      path: 'pkg/__init__.py',
+      content: '',
+      sizeBytes: 0,
+      language: 'python',
+      isTestFile: false,
+    },
+    {
+      path: 'pkg/service.py',
+      content: [
+        'import typing as t',
+        'from .missing_mod import Alpha',
+        'if t.TYPE_CHECKING:',
+        '    from .missing_mod import Beta',
+        '',
+        'def run() -> None:',
+        '    p = Path("/tmp")',
+        '    q = Path("/var")',
+        '',
+      ].join('\n'),
+      sizeBytes: 180,
+      language: 'python',
+      isTestFile: false,
+    },
+  ];
+
+  const check = checkPythonSyntaxAndImports(
+    'pkg/service.py',
+    multiFiles[1].content,
+    multiFiles
+  );
+  const missingModErrors = check.confirmedErrors.filter((e) =>
+    e.includes('.missing_mod')
+  );
+  const pathErrors = check.confirmedErrors.filter((e) =>
+    e.includes('symbol "Path"')
+  );
+
+  assert.equal(
+    missingModErrors.length,
+    1,
+    'Duplicate relative import errors for .missing_mod must be deduplicated to a single entry'
+  );
+  assert.equal(
+    pathErrors.length,
+    1,
+    'Duplicate missing symbol errors for Path must be deduplicated to a single entry'
+  );
+});
+
+test('Scenario 24: User approval gate is strictly enforced before applying changes to individual file and ZIP downloads', async () => {
+  const originalRepo: RepoFile[] = [
+    {
+      path: 'billing/calculator.py',
+      content: 'def total(price: float) -> float:\n    return price - 1\n',
+      sizeBytes: 55,
+      language: 'python',
+      isTestFile: false,
+    },
+  ];
+
+  const proposedChanges = [
+    {
+      filePath: 'billing/calculator.py',
+      explanation: 'Fix off-by-one bug in total()',
+      originalContent: originalRepo[0].content,
+      proposedContent: 'def total(price: float) -> float:\n    return price\n',
+    },
+  ];
+  const diffs = proposedChanges.map(buildFileDiffResult);
+  const unifiedPatchFile = buildCombinedUnifiedPatch(diffs);
+
+  // 1. While pending_review (NOT yet approved by user), export & individual download MUST return original unmodified files
+  const pendingExport = resolveFilesForExport(originalRepo, {
+    approvalStatus: 'pending_review',
+    changes: proposedChanges,
+    unifiedPatchFile,
+  });
+  assert.equal(pendingExport.isApprovedExport, false);
+  assert.equal(pendingExport.unifiedPatchToInclude, null);
+  assert.equal(
+    pendingExport.files[0].content,
+    'def total(price: float) -> float:\n    return price - 1\n'
+  );
+
+  const pendingFileDownload = resolveIndividualFileForDownload(
+    'billing/calculator.py',
+    originalRepo,
+    {
+      approvalStatus: 'pending_review',
+      changes: proposedChanges,
+    },
+    true
+  );
+  assert.ok(pendingFileDownload);
+  assert.equal(pendingFileDownload.isCorrectedVersion, false);
+  assert.equal(
+    pendingFileDownload.content,
+    'def total(price: float) -> float:\n    return price - 1\n'
+  );
+
+  // 2. Once user approves (approved_staged), export & individual download return the corrected content and unified patch
+  const approvedExport = resolveFilesForExport(originalRepo, {
+    approvalStatus: 'approved_staged',
+    changes: proposedChanges,
+    unifiedPatchFile,
+  });
+  assert.equal(approvedExport.isApprovedExport, true);
+  assert.ok(
+    approvedExport.unifiedPatchToInclude?.includes('--- a/billing/calculator.py')
+  );
+  assert.equal(
+    approvedExport.files[0].content,
+    'def total(price: float) -> float:\n    return price\n'
+  );
+
+  const approvedFileDownload = resolveIndividualFileForDownload(
+    'billing/calculator.py',
+    originalRepo,
+    {
+      approvalStatus: 'approved_staged',
+      changes: proposedChanges,
+    },
+    true
+  );
+  assert.ok(approvedFileDownload);
+  assert.equal(approvedFileDownload.isCorrectedVersion, true);
+  assert.equal(approvedFileDownload.fileName, 'calculator.py');
+  assert.equal(
+    approvedFileDownload.content,
+    'def total(price: float) -> float:\n    return price\n'
+  );
+
+  // Verify JSZip archive generation and extraction roundtrip preserves corrected files and patch
+  const zip = new JSZip();
+  for (const f of approvedExport.files) {
+    zip.file(f.path, f.content);
+  }
+  if (approvedExport.unifiedPatchToInclude) {
+    zip.file('repopilot-changes.patch', approvedExport.unifiedPatchToInclude);
+  }
+  const zipBuf = await zip.generateAsync({ type: 'nodebuffer' });
+  const reloadedZip = await JSZip.loadAsync(zipBuf);
+  const extractedPy = await reloadedZip
+    .file('billing/calculator.py')
+    ?.async('string');
+  const extractedPatch = await reloadedZip
+    .file('repopilot-changes.patch')
+    ?.async('string');
+  assert.equal(
+    extractedPy,
+    'def total(price: float) -> float:\n    return price\n'
+  );
+  assert.ok(extractedPatch?.includes('+    return price'));
+
+  // 3. If rejected/reverted, export returns original unmodified files
+  const rejectedExport = resolveFilesForExport(originalRepo, {
+    approvalStatus: 'rejected',
+    changes: proposedChanges,
+    unifiedPatchFile,
+  });
+  assert.equal(rejectedExport.isApprovedExport, false);
+  assert.equal(
+    rejectedExport.files[0].content,
+    'def total(price: float) -> float:\n    return price - 1\n'
+  );
+});
+
+test('Scenario 25: AI response validator deduplicates identified_bugs and remaining_risks and reclassifies hallucinated single-file import bugs', () => {
+  const singleFileRepo: RepoFile[] = [
+    {
+      path: 'app.py',
+      content: [
+        'from pathlib import (',
+        '    Path,',
+        ')',
+        'from .ctx import AppContext',
+        'from . import json',
+        'def run(x: int) -> int:',
+        '    _ = Path(".")',
+        '    return x // 0',
+      ].join('\n'),
+      sizeBytes: 140,
+      language: 'python',
+      isTestFile: false,
+    },
+  ];
+
+  const rawModelJson = JSON.stringify({
+    task_summary: 'Fix ZeroDivisionError in run()',
+    acceptance_criteria: [
+      'Avoid dividing by zero in run()',
+      'Avoid dividing by zero in run()',
+    ],
+    repository_findings: {
+      language: 'Python',
+      dependencies: ['pytest', 'pytest'],
+      entry_points: ['app.py'],
+      relevant_files: ['app.py'],
+      existing_tests: [],
+      caller_relationships: [],
+    },
+    root_cause: {
+      type: 'CONFIRMED',
+      description: 'Integer division by zero in run()',
+      evidence_files: ['app.py', 'app.py'],
+    },
+    identified_bugs: [
+      {
+        file_path: './app.py',
+        line_reference: 'L8',
+        severity: 'high',
+        title: 'Division by zero in run()',
+        explanation: 'x // 0 always raises ZeroDivisionError.',
+        recommended_fix: 'Return x instead of x // 0.',
+      },
+      {
+        file_path: 'app.py',
+        line_reference: 'L8',
+        severity: 'high',
+        title: 'Division by zero in run()',
+        explanation: 'x // 0 always raises ZeroDivisionError.',
+        recommended_fix: 'Return x instead of x // 0.',
+      },
+      {
+        file_path: 'app.py',
+        line_reference: 'L4',
+        severity: 'medium',
+        title: 'Missing relative import .ctx',
+        explanation: 'Unresolved relative import .ctx in app.py.',
+        recommended_fix: 'Upload ctx.py',
+      },
+      {
+        file_path: 'app.py',
+        line_reference: 'L7',
+        severity: 'medium',
+        title: 'Missing import for Path and json',
+        explanation: 'Missing import for Path in app.py.',
+        recommended_fix: 'Import Path from pathlib',
+      },
+    ],
+    clarifying_question: null,
+    files_to_change: ['./app.py'],
+    proposed_patch: [
+      {
+        file_path: './app.py',
+        operation: 'modify',
+        explanation: 'Return x instead of dividing by zero',
+        search_replace_blocks: [
+          {
+            search: '    return x // 0',
+            replace: '    return x',
+          },
+        ],
+      },
+    ],
+    tests_to_run: {
+      targeted_tests: ['pytest -q', 'pytest -q'],
+      full_suite_command: 'pytest -q',
+    },
+    verification_status: 'NOT_VERIFIED',
+    remaining_risks: ['Single file uploaded', 'Single file uploaded'],
+  });
+
+  const validated = validateStructuredAgentResponse(
+    rawModelJson,
+    singleFileRepo
+  );
+  assert.equal(validated.valid, true);
+  assert.ok(validated.parsed);
+  // Duplicate real bug deduplicated to 1, and hallucinated relative-import / Path-json bugs filtered out of identified_bugs
+  assert.equal(validated.parsed.identified_bugs?.length, 1);
+  assert.equal(
+    validated.parsed.identified_bugs?.[0].title,
+    'Division by zero in run()'
+  );
+  assert.equal(validated.parsed.identified_bugs?.[0].file_path, 'app.py');
+  assert.equal(validated.parsed.acceptance_criteria.length, 1);
+  assert.deepEqual(validated.parsed.files_to_change, ['app.py']);
+});
+
+test('Scenario 26: Nebius Token Factory (https://api.tokenfactory.nebius.com/v1) and NVIDIA open-source model adapter format requests and handle HTTP 401/404/429/500 errors with mocked fetch', async () => {
+  const savedNebiusUrl = process.env.NEBIUS_BASE_URL;
+  const savedNebiusModel = process.env.NEBIUS_MODEL;
+  const savedNebiusKey = process.env.NEBIUS_API_KEY;
+  const savedNvidiaModel = process.env.NVIDIA_MODEL;
+
+  try {
+    delete process.env.NEBIUS_BASE_URL;
+    delete process.env.NEBIUS_MODEL;
+    process.env.NVIDIA_MODEL = 'nvidia/llama-3.1-nemotron-70b-instruct';
+
+    const providers = getServerAIProviders();
+    const nebius = providers.find((p) => p.id === 'nebius')!;
+    const nvidia = providers.find((p) => p.id === 'nvidia')!;
+
+    // Verify default Nebius Token Factory base URL is https://api.tokenfactory.nebius.com/v1
+    assert.equal(nebius.endpointUrl, 'https://api.tokenfactory.nebius.com/v1');
+    // Verify exact user-configured NVIDIA_MODEL is honored
+    assert.equal(nvidia.defaultModel, 'nvidia/llama-3.1-nemotron-70b-instruct');
+    assert.equal(nebius.defaultModel, 'nvidia/llama-3.1-nemotron-70b-instruct');
+
+    // Mock fetch for successful Nebius Token Factory call with NVIDIA Nemotron model
+    let capturedUrl = '';
+    let capturedAuth = '';
+    let capturedBody: Record<string, unknown> = {};
+
+    const mockSuccessFetch: typeof fetch = async (input, init) => {
+      capturedUrl = String(input);
+      const headers = (init?.headers || {}) as Record<string, string>;
+      capturedAuth = headers.Authorization || '';
+      capturedBody = JSON.parse(String(init?.body || '{}'));
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  task_summary: 'Fix boundary check via Nebius Token Factory',
+                  acceptance_criteria: ['Exclusive > threshold check'],
+                  repository_findings: {
+                    language: 'Python',
+                    dependencies: ['pytest'],
+                    entry_points: ['billing/calculator.py'],
+                    relevant_files: ['billing/calculator.py'],
+                    existing_tests: ['tests/test_calculator.py'],
+                    caller_relationships: [],
+                  },
+                  root_cause: {
+                    type: 'CONFIRMED',
+                    description: ' Uses >= instead of > for bulk threshold',
+                    evidence_files: ['billing/calculator.py'],
+                  },
+                  identified_bugs: [
+                    {
+                      file_path: 'billing/calculator.py',
+                      line_reference: 'L18',
+                      severity: 'high',
+                      title: 'Inclusive threshold check',
+                      explanation: 'Uses >= instead of >',
+                      recommended_fix: 'Use > threshold',
+                    },
+                  ],
+                  clarifying_question: null,
+                  files_to_change: ['billing/calculator.py'],
+                  proposed_patch: [
+                    {
+                      file_path: 'billing/calculator.py',
+                      operation: 'modify',
+                      explanation: 'Use > threshold',
+                      search_replace_blocks: [
+                        {
+                          search: 'if subtotal_cents >= bulk_threshold_cents:',
+                          replace: 'if subtotal_cents > bulk_threshold_cents:',
+                        },
+                      ],
+                    },
+                  ],
+                  tests_to_run: {
+                    targeted_tests: ['tests/test_calculator.py'],
+                    full_suite_command: 'pytest -q',
+                  },
+                  verification_status: 'NOT_VERIFIED',
+                  remaining_risks: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+
+    const rawText = await callOpenAICompatibleProvider(
+      nebius.endpointUrl,
+      'nebius-test-key-1234567890',
+      'nvidia/Llama-3_1-Nemotron-Ultra-253B-v1',
+      'System prompt',
+      'User prompt',
+      mockSuccessFetch
+    );
+
+    assert.equal(
+      capturedUrl,
+      'https://api.tokenfactory.nebius.com/v1/chat/completions'
+    );
+    assert.equal(capturedAuth, 'Bearer nebius-test-key-1234567890');
+    assert.equal(
+      capturedBody.model,
+      'nvidia/Llama-3_1-Nemotron-Ultra-253B-v1'
+    );
+    assert.ok(rawText.includes('Fix boundary check via Nebius Token Factory'));
+
+    // Test HTTP 401 Authentication error handling
+    const mock401Fetch: typeof fetch = async () =>
+      new Response('Invalid API key provided: sk-secret1234567890abcdef', {
+        status: 401,
+      });
+    await assert.rejects(
+      () =>
+        callOpenAICompatibleProvider(
+          nebius.endpointUrl,
+          'nebius-bad-key',
+          'nvidia/Llama-3_1-Nemotron-Ultra-253B-v1',
+          'sys',
+          'usr',
+          mock401Fetch
+        ),
+      (err: Error) => {
+        assert.ok(err.message.includes('Authentication failed (401)'));
+        assert.ok(!err.message.includes('sk-secret1234567890abcdef'));
+        return true;
+      }
+    );
+
+    // Test HTTP 429 Rate limit error handling
+    const mock429Fetch: typeof fetch = async () =>
+      new Response('Rate limit exceeded for tokenfactory', { status: 429 });
+    await assert.rejects(
+      () =>
+        callOpenAICompatibleProvider(
+          nebius.endpointUrl,
+          'nebius-key',
+          'nvidia/Llama-3_1-Nemotron-Ultra-253B-v1',
+          'sys',
+          'usr',
+          mock429Fetch
+        ),
+      /Rate limit exceeded \(429\)/
+    );
+
+    // Test HTTP 404 Model not found error handling
+    const mock404Fetch: typeof fetch = async () =>
+      new Response('Model not found', { status: 404 });
+    await assert.rejects(
+      () =>
+        callOpenAICompatibleProvider(
+          nvidia.endpointUrl,
+          'nvapi-testkey1234567890',
+          'nvidia/nonexistent-model',
+          'sys',
+          'usr',
+          mock404Fetch
+        ),
+      /Model "nvidia\/nonexistent-model" or endpoint not found \(404\)/
+    );
+  } finally {
+    if (savedNebiusUrl === undefined) delete process.env.NEBIUS_BASE_URL;
+    else process.env.NEBIUS_BASE_URL = savedNebiusUrl;
+    if (savedNebiusModel === undefined) delete process.env.NEBIUS_MODEL;
+    else process.env.NEBIUS_MODEL = savedNebiusModel;
+    if (savedNebiusKey === undefined) delete process.env.NEBIUS_API_KEY;
+    else process.env.NEBIUS_API_KEY = savedNebiusKey;
+    if (savedNvidiaModel === undefined) delete process.env.NVIDIA_MODEL;
+    else process.env.NVIDIA_MODEL = savedNvidiaModel;
+  }
+});
+
+test('Scenario 27: Missing Nebius or NVIDIA credentials fail with a clear setup error and NEVER silently fall back to Gemini', async () => {
+  const savedNebiusKey = process.env.NEBIUS_API_KEY;
+  const savedNvidiaKey = process.env.NVIDIA_API_KEY;
+  const savedGeminiKey = process.env.GEMINI_API_KEY;
+
+  try {
+    delete process.env.NEBIUS_API_KEY;
+    delete process.env.NVIDIA_API_KEY;
+    // Even if GEMINI_API_KEY is present on the server, selecting Nebius or NVIDIA must NOT silently fall back to Gemini
+    process.env.GEMINI_API_KEY = 'AIzaSyTestValidLookingKeyForUnitTestOnly123';
+
+    const nebiusCred = checkProviderCredentials('nebius');
+    assert.equal(nebiusCred.configured, false);
+    assert.equal(nebiusCred.envVarName, 'NEBIUS_API_KEY');
+    assert.ok(nebiusCred.message?.includes('Configuration Error'));
+
+    await assert.rejects(
+      () =>
+        generateAnalysisAndPatch({
+          providerId: 'nebius',
+          repoId: SAMPLE_REPOSITORIES[0].id,
+          files: SAMPLE_REPOSITORIES[0].files,
+          taskDescription: 'Fix the discount bug',
+          // Even when requireRealCredentials is omitted/false, Nebius must never silently fall back to Gemini
+        }),
+      (err: Error) => {
+        assert.ok(err.message.includes('Configuration Error'));
+        assert.ok(err.message.includes('NEBIUS_API_KEY'));
+        return true;
+      }
+    );
+
+    await assert.rejects(
+      () =>
+        generateAnalysisAndPatch({
+          providerId: 'nvidia',
+          repoId: SAMPLE_REPOSITORIES[0].id,
+          files: SAMPLE_REPOSITORIES[0].files,
+          taskDescription: 'Fix the discount bug',
+        }),
+      (err: Error) => {
+        assert.ok(err.message.includes('Configuration Error'));
+        assert.ok(err.message.includes('NVIDIA_API_KEY'));
+        return true;
+      }
+    );
+  } finally {
+    if (savedNebiusKey === undefined) delete process.env.NEBIUS_API_KEY;
+    else process.env.NEBIUS_API_KEY = savedNebiusKey;
+    if (savedNvidiaKey === undefined) delete process.env.NVIDIA_API_KEY;
+    else process.env.NVIDIA_API_KEY = savedNvidiaKey;
+    if (savedGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = savedGeminiKey;
+  }
+});
+
+test('Scenario 28: Sandbox runner enforces user approval gate, applies patches in a disposable workspace, caps repairs at 2 attempts, and reports accurate passed/failed/skipped/notRun counts', async () => {
+  const billingRepo = SAMPLE_REPOSITORIES[0];
+  const originalSnapshot = billingRepo.files.map((f) => ({ ...f }));
+
+  // Build an initial buggy patch (leaves a bug so tests fail)
+  const initialDet = buildDeterministicAnalysisAndPatch(
+    billingRepo.id,
+    billingRepo.files,
+    'Fix bulk discount (triggers 1-retry boundary first)',
+    'initial',
+    'Nebius Token Factory'
+  );
+  const diffs = initialDet.changes.map(buildFileDiffResult);
+
+  // 1. Unapproved patch bundle MUST be rejected by runSandboxAndRepairLoop
+  const unapprovedBundle: ProposedPatchBundle = {
+    id: 'patch-unapproved',
+    taskDescription: 'Fix bulk discount',
+    plan: initialDet.plan,
+    structuredOutput: initialDet.structuredOutput,
+    changes: initialDet.changes,
+    diffs,
+    unifiedPatchFile: buildCombinedUnifiedPatch(diffs),
+    approvalStatus: 'pending_review',
+    attemptNumber: 1,
+    verificationStatus: 'NOT_VERIFIED',
+    patchValidationPassed: true,
+  };
+
+  await assert.rejects(
+    () =>
+      runSandboxAndRepairLoop({
+        repoId: billingRepo.id,
+        originalFiles: billingRepo.files,
+        patchBundle: unapprovedBundle,
+        mode: 'demo_simulation_labeled',
+        providerId: 'gemini',
+      }),
+    /Safety Gate: Proposed patch must be explicitly approved/
+  );
+
+  // 2. When safe execution is unavailable in strict_isolated_only mode, tests are accurately marked as notRun
+  const approvedBundle: ProposedPatchBundle = {
+    ...unapprovedBundle,
+    id: 'patch-approved',
+    approvalStatus: 'approved_staged',
+  };
+
+  const blockedRes = await runSandboxAndRepairLoop({
+    repoId: billingRepo.id,
+    originalFiles: billingRepo.files,
+    patchBundle: approvedBundle,
+    mode: 'strict_isolated_only',
+    providerId: 'gemini',
+  });
+  assert.equal(blockedRes.overallStatus, 'not_verified');
+  assert.ok(blockedRes.testSummary);
+  assert.equal(blockedRes.testSummary.passed, 0);
+  assert.equal(blockedRes.testSummary.failed, 0);
+  assert.equal(blockedRes.testSummary.skipped, 0);
+  assert.ok(blockedRes.testSummary.notRun >= 1);
+  assert.equal(blockedRes.testSummary.executionAvailable, false);
+
+  // 3. When tests fail repeatedly, repairGeneratorFn is called at most 2 times (maxRetries = 2 -> 3 total attempts)
+  let repairCallsCount = 0;
+  const capturedFailureContexts: string[] = [];
+
+  const alwaysFailingRepairGenerator: typeof generateAnalysisAndPatch = async (
+    repairParams
+  ) => {
+    repairCallsCount += 1;
+    capturedFailureContexts.push(repairParams.failureContext || '');
+    // Return the same still-failing patch so tests continue to fail
+    return {
+      structuredOutput: initialDet.structuredOutput,
+      plan: initialDet.plan,
+      changes: initialDet.changes,
+      diagnostics: {} as any,
+      patchValidationPassed: true,
+      verificationStatus: 'NOT_VERIFIED',
+      repairNotes: `Mock repair attempt #${repairCallsCount}`,
+    };
+  };
+
+  const exhaustedRes = await runSandboxAndRepairLoop({
+    repoId: billingRepo.id,
+    originalFiles: billingRepo.files,
+    patchBundle: approvedBundle,
+    mode: 'demo_simulation_labeled',
+    providerId: 'gemini',
+    repairGeneratorFn: alwaysFailingRepairGenerator,
+  });
+
+  // Verify maxRetries = 2 was strictly enforced (1 initial attempt + 2 repair retries = 3 attempts total)
+  assert.equal(repairCallsCount, 2);
+  assert.equal(exhaustedRes.maxRetries, 2);
+  assert.equal(exhaustedRes.retryCount, 2);
+  assert.equal(exhaustedRes.attempts.length, 3);
+  assert.equal(exhaustedRes.overallStatus, 'failed_after_retries');
+  assert.equal(exhaustedRes.verificationStatus, 'FAILED');
+  assert.ok(exhaustedRes.testSummary);
+  assert.ok(exhaustedRes.testSummary.failed >= 1);
+  assert.equal(exhaustedRes.testSummary.notRun, 0);
+  // Verify actual failure output was sent to the AI repair model
+  assert.equal(capturedFailureContexts.length, 2);
+  assert.ok(capturedFailureContexts[0].includes('FAILED'));
+
+  // Verify originalFiles were never mutated in place (disposable workspace immutability)
+  assert.deepEqual(billingRepo.files, originalSnapshot);
+});
+
+
+
+
 
 

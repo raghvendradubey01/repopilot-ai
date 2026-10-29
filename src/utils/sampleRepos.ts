@@ -1,5 +1,6 @@
 import type {
   AIAnalysisPlan,
+  BugReportItem,
   CodeSelectionContext,
   FilePatchChange,
   QuickAgentActionType,
@@ -701,6 +702,28 @@ export function detectNoChangeNeededTask(
   return { isNoChange: false };
 }
 
+function computeLineRangeForChange(
+  originalContent: string,
+  proposedContent: string
+): string {
+  const origLines = originalContent.split('\n');
+  const propLines = proposedContent.split('\n');
+  let firstDiff = -1;
+  let lastDiff = -1;
+  const maxLen = Math.max(origLines.length, propLines.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    if (origLines[i] !== propLines[i]) {
+      if (firstDiff === -1) firstDiff = i + 1;
+      lastDiff = Math.min(origLines.length, i + 1);
+    }
+  }
+
+  if (firstDiff === -1) return 'L1';
+  if (firstDiff === lastDiff) return `L${firstDiff}`;
+  return `L${firstDiff}–L${Math.max(firstDiff, lastDiff)}`;
+}
+
 export function convertStructuredOutputToLegacyPlanAndChanges(
   structured: StructuredAgentOutput,
   originalFiles: readonly RepoFile[],
@@ -739,6 +762,47 @@ export function convertStructuredOutputToLegacyPlanAndChanges(
       originalContent: orig,
       proposedContent: proposed,
     });
+  }
+
+  const derivedBugs: BugReportItem[] =
+    structured.identified_bugs && structured.identified_bugs.length > 0
+      ? structured.identified_bugs
+      : changes.length > 0
+      ? changes.map((c) => ({
+          file_path: c.filePath,
+          line_reference: computeLineRangeForChange(
+            c.originalContent,
+            c.proposedContent
+          ),
+          severity:
+            structured.root_cause.type === 'CONFIRMED' ? 'high' : 'medium',
+          title: `Issue in ${c.filePath}`,
+          explanation: structured.root_cause.description,
+          recommended_fix: c.explanation,
+        }))
+      : structured.root_cause.type === 'CONFIRMED' ||
+        structured.root_cause.type === 'HYPOTHESIS'
+      ? [
+          {
+            file_path:
+              structured.root_cause.evidence_files[0] ||
+              originalFiles[0]?.path ||
+              'repository',
+            line_reference: 'L1',
+            severity:
+              structured.root_cause.type === 'CONFIRMED' ? 'high' : 'medium',
+            title:
+              structured.root_cause.type === 'CONFIRMED'
+                ? 'Confirmed Issue'
+                : 'Code Finding',
+            explanation: structured.root_cause.description,
+            recommended_fix: structured.task_summary,
+          },
+        ]
+      : [];
+
+  if (!structured.identified_bugs || structured.identified_bugs.length === 0) {
+    structured.identified_bugs = derivedBugs;
   }
 
   const steps: AIAnalysisPlan['steps'] =
@@ -782,6 +846,7 @@ export function convertStructuredOutputToLegacyPlanAndChanges(
     summary: structured.task_summary,
     rootCause: `[${structured.root_cause.type}] ${structured.root_cause.description}`,
     rootCauseType: structured.root_cause.type,
+    identifiedBugs: derivedBugs,
     acceptanceCriteria: structured.acceptance_criteria,
     repositoryFindings: structured.repository_findings,
     clarifyingQuestion: structured.clarifying_question ?? null,

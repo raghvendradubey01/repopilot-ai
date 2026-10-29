@@ -224,7 +224,7 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '8mb' }));
+  app.use(express.json({ limit: '12mb' }));
 
   // 1. System & Provider Status (Never exposes secret API key strings)
   app.get('/api/status', (_req, res) => {
@@ -346,6 +346,7 @@ async function startServer() {
         selectionContext,
         contextTokenBudget: contextTokenBudget || 8000,
         stage: 'initial',
+        requireRealCredentials: true,
       });
 
       const diffs = analysis.changes.map(buildFileDiffResult);
@@ -408,7 +409,11 @@ async function startServer() {
         err instanceof Error ? err.message : 'VS Code agent turn failed.',
         getKnownServerSecrets()
       );
-      res.status(500).json({ error: safeErr });
+      const isConfigErr = safeErr.includes('Configuration Error');
+      res.status(isConfigErr ? 400 : 500).json({
+        error: safeErr,
+        code: isConfigErr ? 'MISSING_AI_CREDENTIALS' : 'AI_PROVIDER_ERROR',
+      });
     }
   });
 
@@ -431,13 +436,134 @@ async function startServer() {
     }
   });
 
-  // 2. Fallback: Validate Uploaded ZIP Archive or Synthetic Security Test Fixture
+  // 2. Validate & Process Uploaded Project (ZIP Archive OR Multiple Individual Source Files)
+  app.post('/api/upload-project', async (req, res) => {
+    try {
+      const {
+        projectName,
+        base64Zip,
+        files,
+        limits,
+      } = req.body as {
+        projectName?: string;
+        base64Zip?: string;
+        files?: Array<{
+          path: string;
+          content: string;
+          sizeBytes?: number;
+        }>;
+        limits?: {
+          maxFileBytes?: number;
+          maxArchiveBytes?: number;
+          maxFileCount?: number;
+        };
+      };
+
+      const validatorOpts = {
+        maxFileBytes: limits?.maxFileBytes,
+        maxArchiveBytes: limits?.maxArchiveBytes,
+        maxFileCount: limits?.maxFileCount,
+        excludeSecretsAndBinariesByDefault: true,
+      };
+
+      let rawEntries: RawArchiveEntry[] = [];
+      let resolvedName = projectName?.trim() || 'uploaded-project';
+
+      if (base64Zip && typeof base64Zip === 'string') {
+        const zipBuffer = Buffer.from(base64Zip, 'base64');
+        const maxCompressed = Math.max(
+          6 * 1024 * 1024,
+          limits?.maxArchiveBytes || 6 * 1024 * 1024
+        );
+        if (zipBuffer.byteLength > maxCompressed) {
+          res.status(400).json({
+            error: `Uploaded ZIP archive (${(
+              zipBuffer.byteLength /
+              (1024 * 1024)
+            ).toFixed(2)} MB) exceeds the ${(
+              maxCompressed /
+              (1024 * 1024)
+            ).toFixed(1)} MB compressed upload limit.`,
+          });
+          return;
+        }
+        rawEntries = await parseZipBufferToRawEntries(zipBuffer);
+        resolvedName = resolvedName.replace(/\.zip$/i, '');
+      } else if (Array.isArray(files) && files.length > 0) {
+        rawEntries = files.map((f) => {
+          const text = typeof f.content === 'string' ? f.content : '';
+          return {
+            path: String(f.path || '').trim(),
+            content: text,
+            uncompressedBytes:
+              typeof f.sizeBytes === 'number' && f.sizeBytes >= 0
+                ? f.sizeBytes
+                : Buffer.byteLength(text, 'utf8'),
+            isDirectory: false,
+          };
+        });
+      } else {
+        res.status(400).json({
+          error:
+            'Please provide either a base64Zip archive or an array of individual source files.',
+        });
+        return;
+      }
+
+      const result = validateRepositoryEntries(
+        resolvedName,
+        rawEntries,
+        validatorOpts
+      );
+
+      if (!result.report.valid) {
+        const firstErr =
+          result.report.issues.find((i) => i.severity === 'error')?.message ||
+          'Uploaded files failed security or size validation.';
+        res.status(400).json({
+          error: firstErr,
+          projectName: resolvedName,
+          report: result.report,
+          acceptedFiles: [],
+        });
+        return;
+      }
+
+      res.json({
+        projectName: resolvedName,
+        report: result.report,
+        acceptedFiles: result.acceptedFiles,
+      });
+    } catch (err) {
+      const message = redactSecrets(
+        err instanceof Error ? err.message : 'Failed to process uploaded files.',
+        getKnownServerSecrets()
+      );
+      res.status(400).json({
+        error: `Upload validation error: ${message}`,
+      });
+    }
+  });
+
+  // 2a. Validate Uploaded ZIP Archive or Synthetic Security Test Fixture
   app.post('/api/validate-zip', async (req, res) => {
     try {
-      const { archiveName, base64Zip, testMaliciousFixture } = req.body as {
+      const {
+        archiveName,
+        base64Zip,
+        testMaliciousFixture,
+        limits,
+        excludeSecretsAndBinariesByDefault,
+      } = req.body as {
         archiveName?: string;
         base64Zip?: string;
         testMaliciousFixture?: boolean;
+        limits?: {
+          maxFileBytes?: number;
+          maxArchiveBytes?: number;
+          maxFileCount?: number;
+        };
+        excludeSecretsAndBinariesByDefault?: boolean;
       };
 
       if (testMaliciousFixture) {
@@ -468,7 +594,15 @@ async function startServer() {
       const rawEntries = await parseZipBufferToRawEntries(zipBuffer);
       const result = validateRepositoryEntries(
         archiveName || 'uploaded-repo.zip',
-        rawEntries
+        rawEntries,
+        {
+          maxFileBytes: limits?.maxFileBytes,
+          maxArchiveBytes: limits?.maxArchiveBytes,
+          maxFileCount: limits?.maxFileCount,
+          excludeSecretsAndBinariesByDefault: Boolean(
+            excludeSecretsAndBinariesByDefault
+          ),
+        }
       );
       res.json(result);
     } catch (err) {
@@ -559,7 +693,9 @@ async function startServer() {
 
       const rawEntries = await parseZipBufferToRawEntries(zipBuffer);
       const archiveLabel = `${parsed.owner}-${parsed.repo}.zip`;
-      const result = validateRepositoryEntries(archiveLabel, rawEntries);
+      const result = validateRepositoryEntries(archiveLabel, rawEntries, {
+        excludeSecretsAndBinariesByDefault: true,
+      });
 
       res.json({
         ...result,
@@ -617,6 +753,7 @@ async function startServer() {
         selectionContext,
         contextTokenBudget: contextTokenBudget || 8000,
         stage: 'initial',
+        requireRealCredentials: true,
       });
 
       const diffs = analysis.changes.map(buildFileDiffResult);
@@ -663,7 +800,11 @@ async function startServer() {
         err instanceof Error ? err.message : 'Analysis failed.',
         getKnownServerSecrets()
       );
-      res.status(500).json({ error: safeErr });
+      const isConfigErr = safeErr.includes('Configuration Error');
+      res.status(isConfigErr ? 400 : 500).json({
+        error: safeErr,
+        code: isConfigErr ? 'MISSING_AI_CREDENTIALS' : 'AI_PROVIDER_ERROR',
+      });
     }
   });
 

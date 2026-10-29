@@ -74,6 +74,47 @@ export interface ExcludedFileEntry {
   detail: string;
 }
 
+export type PythonImportCategory =
+  | 'stdlib'
+  | 'third_party'
+  | 'package_relative'
+  | 'local_module';
+
+export interface ClassifiedImportEntry {
+  rawSpecifier: string;
+  moduleName: string;
+  importedNames: string[];
+  category: PythonImportCategory;
+  relativeLevel: number;
+  resolvedFilePath?: string | null;
+  resolutionStatus:
+    | 'resolved_local'
+    | 'stdlib'
+    | 'third_party'
+    | 'unresolved_missing_context'
+    | 'unresolved_in_manifest';
+}
+
+export interface CategorizedValidationFindings {
+  confirmedErrors: string[];
+  possibleIssues: string[];
+  contextChecks: string[];
+  isIncompleteContext: boolean;
+  contextCompletenessNote?: string;
+}
+
+export interface NormalizedProjectManifest {
+  projectName: string;
+  uploadMode: 'single_file' | 'multi_file' | 'zip_archive';
+  isIncompleteContext: boolean;
+  contextCompletenessNote: string;
+  normalizedFilePaths: string[];
+  pythonModuleMap: Record<string, string>;
+  packageDirectories: string[];
+  declaredDependencies: string[];
+  excludedFrameworkOrEnvPaths: string[];
+}
+
 export interface ValidationReport {
   valid: boolean;
   archiveName: string;
@@ -85,6 +126,9 @@ export interface ValidationReport {
   maxAllowedArchiveBytes: number;
   issues: ValidationIssue[];
   excludedFiles?: ExcludedFileEntry[];
+  isIncompleteContext?: boolean;
+  contextCompletenessNote?: string;
+  categorizedFindings?: CategorizedValidationFindings;
   checksSummary: {
     pathTraversalPassed: boolean;
     sizeLimitsPassed: boolean;
@@ -97,8 +141,10 @@ export interface FileSymbolMetadata {
   path: string;
   definedFunctions: string[];
   definedClasses: string[];
+  definedVariables?: string[];
   importedModules: string[];
   importedSymbols: string[];
+  classifiedImports?: ClassifiedImportEntry[];
   calledSymbols: string[];
   lineCount: number;
 }
@@ -136,6 +182,11 @@ export interface RepositoryFindings {
   caller_relationships: string[];
   total_files_indexed?: number;
   excluded_paths?: string[];
+  is_incomplete_context?: boolean;
+  context_completeness_note?: string;
+  confirmed_errors?: string[];
+  possible_issues?: string[];
+  context_checks?: string[];
 }
 
 export interface ContextFileSelection {
@@ -224,6 +275,23 @@ export interface StructuredRootCause {
   evidence_files: string[];
 }
 
+export type BugSeverity = 'critical' | 'high' | 'medium' | 'low';
+
+export interface BugReportItem {
+  file_path: string;
+  line_reference: string;
+  severity: BugSeverity;
+  title: string;
+  explanation: string;
+  recommended_fix: string;
+}
+
+export interface UploadLimitsConfig {
+  maxFileBytes: number;
+  maxArchiveBytes: number;
+  maxFileCount: number;
+}
+
 export interface SearchReplaceHunk {
   search: string;
   replace: string;
@@ -242,6 +310,7 @@ export interface StructuredAgentOutput {
   acceptance_criteria: string[];
   repository_findings: RepositoryFindings;
   root_cause: StructuredRootCause;
+  identified_bugs?: BugReportItem[];
   clarifying_question?: string | null;
   files_to_change: string[];
   proposed_patch: ProposedFilePatchItem[];
@@ -261,6 +330,10 @@ export interface PatchValidationDiagnostic {
   importsValid: boolean;
   errors: string[];
   warnings: string[];
+  confirmedErrors?: string[];
+  possibleIssues?: string[];
+  contextChecks?: string[];
+  isIncompleteContext?: boolean;
 }
 
 export interface AgentDiagnosticsReport {
@@ -301,6 +374,7 @@ export interface AIAnalysisPlan {
   summary: string;
   rootCause: string;
   rootCauseType?: RootCauseClassification;
+  identifiedBugs?: BugReportItem[];
   acceptanceCriteria?: string[];
   repositoryFindings?: RepositoryFindings;
   clarifyingQuestion?: string | null;
@@ -395,6 +469,8 @@ export interface SandboxAttemptLog {
   failedTests: string[];
   passedCount: number;
   failedCount: number;
+  skippedCount?: number;
+  notRunCount?: number;
   syntaxAndImportErrors?: string[];
   repairAnalysis?: string;
   repairedFiles?: FilePatchChange[];
@@ -404,6 +480,14 @@ export interface SandboxAttemptLog {
     timeoutMs: number;
     networkAccess: 'disabled';
   };
+}
+
+export interface SandboxTestSummary {
+  passed: number;
+  failed: number;
+  skipped: number;
+  notRun: number;
+  executionAvailable: boolean;
 }
 
 export interface SandboxRunResponse {
@@ -425,6 +509,7 @@ export interface SandboxRunResponse {
   bannerMessage: string;
   retryCount: number;
   maxRetries: number;
+  testSummary?: SandboxTestSummary;
   attempts: SandboxAttemptLog[];
   finalPatchBundle?: ProposedPatchBundle;
   diagnostics?: AgentDiagnosticsReport;
